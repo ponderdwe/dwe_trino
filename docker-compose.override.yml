@@ -1,0 +1,11 @@
+# Local dev — pure Trino only; start dwe_iceberg_catalog separately first.
+# CATALOG_URL in .env must point to http://host.docker.internal:19120
+# On Linux, extra_hosts maps host.docker.internal to the host gateway IP.
+
+services:
+  trino:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+  trino-worker:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

@@ -1,0 +1,35 @@
+# Production: docker-compose -f docker-compose.yml up -d
+# Local dev:  docker-compose up -d  (merges override)
+#
+# Before first start: python3 config_generator.py envs_dev.json --env-file .env
+
+services:
+  trino:
+    image: trinodb/trino:471
+    container_name: trino
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./trino/coordinator-config.properties:/etc/trino/config.properties
+      - ./trino/trino_connections/iceberg.properties:/etc/trino/catalog/iceberg.properties
+      - ./trino/password-authenticator.properties:/etc/trino/password-authenticator.properties
+      - ./trino/password.db:/etc/trino/password.db
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/v1/info | grep -q '\"starting\":false' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  trino-worker:
+    image: trinodb/trino:471
+    restart: unless-stopped
+    depends_on:
+      trino:
+        condition: service_healthy
+    volumes:
+      - ./trino/worker-config.properties:/etc/trino/config.properties
+      - ./trino/trino_connections/iceberg.properties:/etc/trino/catalog/iceberg.properties
+      - ./trino/password-authenticator.properties:/etc/trino/password-authenticator.properties
+      - ./trino/password.db:/etc/trino/password.db
