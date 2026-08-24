@@ -61,10 +61,19 @@ def get_secret(kv_name: str, sid: str) -> dict:
 
 secrets = get_secret(key_vault_name, secret_id)
 
+# Read iceberg output secret for shared infrastructure values (subnet, storage)
+_iceberg_meta: dict = {}
+try:
+    _iceberg_meta = get_secret(key_vault_name, f"iceberg-metadata-{env}-output")
+except Exception:
+    pass
+
 # ── Infrastructure ────────────────────────────────────────────────────────────
 vnet_id            = secrets["VNET_ID"]
 app_gw_subnet_id   = secrets["APP_GW_SUBNET_ID"]
-vm_subnet_id       = secrets["VM_SUBNET_ID"]
+vm_subnet_id       = _iceberg_meta.get("VM_SUBNET_ID") or secrets.get("VM_SUBNET_ID", "")
+if not vm_subnet_id:
+    raise ValueError("VM_SUBNET_ID not found in iceberg-metadata output secret or Key Vault secret")
 ssh_public_key     = secrets["SSH_PUBLIC_KEY"]
 
 # ── Networking / DNS ──────────────────────────────────────────────────────────
