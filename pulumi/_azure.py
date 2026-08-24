@@ -363,6 +363,12 @@ git -C /home/ubuntu/trino rev-parse HEAD > /home/ubuntu/trino/.schema-version
 
 # Write .env from all Key Vault secret key=value pairs
 echo "$SECRET_JSON" | jq -r 'to_entries[] | .key + "=" + (.value | tostring)' > /home/ubuntu/trino/.env
+
+# Merge iceberg catalog storage credentials if the output secret exists
+ICEBERG_META=$(az keyvault secret show --vault-name {key_vault_name} --name iceberg-metadata-{env}-output --query value -o tsv 2>/dev/null || true)
+if [ -n "$ICEBERG_META" ]; then
+  echo "$ICEBERG_META" | jq -r 'to_entries[] | .key + "=" + (.value | tostring)' >> /home/ubuntu/trino/.env
+fi
 chmod 600 /home/ubuntu/trino/.env
 
 # Generate Trino config files (coordinator-config.properties, iceberg.properties, password.db)
