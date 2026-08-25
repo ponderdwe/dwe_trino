@@ -118,21 +118,6 @@ kv_access = azure_native.authorization.RoleAssignment(
     principal_type="ServicePrincipal",
 )
 
-# Reader on resource group — needed so worker VMs can call az vmss nic list
-# to discover the coordinator's private IP at boot time
-rg_reader = azure_native.authorization.RoleAssignment(
-    f"{project_name}-rg-reader{suffix}",
-    scope=pulumi.Output.format(
-        "/subscriptions/{0}/resourceGroups/{1}",
-        subscription_id, resource_group,
-    ),
-    role_definition_id=pulumi.Output.format(
-        "/subscriptions/{0}/providers/Microsoft.Authorization/roleDefinitions/acdd72a7-3385-48ef-bd42-f606fba81ae7",
-        subscription_id,
-    ),
-    principal_id=identity.principal_id,
-    principal_type="ServicePrincipal",
-)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PostgreSQL database for Nessie — created in the existing cluster
@@ -402,13 +387,9 @@ echo "NESSIE_DB_USER={nessie_db_user}" >> /home/ubuntu/trino/.env
 echo "AZURE_STORAGE_ACCOUNT={sa_name}" >> /home/ubuntu/trino/.env
 echo "AZURE_STORAGE_KEY={sa_key}" >> /home/ubuntu/trino/.env
 echo "ICEBERG_WAREHOUSE_DIR=abfs://warehouse@{sa_name}.dfs.core.windows.net/" >> /home/ubuntu/trino/.env
-
-# Use the VM's own private IP as discovery URI so external workers can reach it
-COORDINATOR_IP=$(hostname -I | awk '{{print $1}}')
-echo "TRINO_DISCOVERY_URI=http://$COORDINATOR_IP:8080" >> /home/ubuntu/trino/.env
 chmod 600 /home/ubuntu/trino/.env
 
-# Start Nessie on host network so it's reachable by Trino coordinator container
+# Start Nessie on host network so it's reachable by Trino containers via docker0 gateway
 docker run -d \\
   --name nessie \\
   --restart unless-stopped \\
@@ -425,27 +406,14 @@ until curl -sf http://localhost:19120/api/v2/config > /dev/null 2>&1; do
   sleep 5
 done
 
-# Trino coordinator reaches Nessie via the docker0 bridge gateway (host network)
+# Trino containers reach Nessie via the docker0 bridge gateway
 DOCKER_GW=$(ip -4 addr show docker0 2>/dev/null | grep 'inet ' | awk '{{print $2}}' | cut -d/ -f1 || echo "172.17.0.1")
-echo "CATALOG_URL=http://${{DOCKER_GW}}:19120/api/v2" >> /home/ubuntu/trino/.env
+echo "CATALOG_URL=http://$DOCKER_GW:19120/api/v2" >> /home/ubuntu/trino/.env
 
-# Generate Trino config files and start coordinator only
+# Generate Trino config and start coordinator + worker on the same VM
 cd /home/ubuntu/trino
 python3 config_generator.py envs_prod.json --env-file .env
-# Override discovery.uri in case config generator variable substitution fails
-sed -i "s|discovery.uri=.*|discovery.uri=http://$COORDINATOR_IP:8080|" trino/coordinator-config.properties trino/worker-config.properties
-docker-compose -f docker-compose.yml up -d trino
-
-# Publish coordinator IP to blob storage so workers can discover it without RBAC
-echo "$COORDINATOR_IP" > /tmp/coordinator-ip.txt
-az storage blob upload \
-  --account-name "{sa_name}" \
-  --account-key "{sa_key}" \
-  --container-name "warehouse" \
-  --name "coordinator-ip.txt" \
-  --file /tmp/coordinator-ip.txt \
-  --overwrite
-echo "Published coordinator IP $COORDINATOR_IP to blob storage"
+docker-compose -f docker-compose.yml up -d
 """
     return base64.b64encode(script.encode()).decode()
 
@@ -528,159 +496,7 @@ coordinator_vmss = azure_native.compute.VirtualMachineScaleSet(
     ),
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Worker startup script — Trino worker only, discovers coordinator IP via blob
-# ─────────────────────────────────────────────────────────────────────────────
-def _build_worker_script(sa_name: str, sa_key: str) -> str:
-    script = f"""#!/bin/bash
-set -e
-exec > >(tee /var/log/trino-worker-init.log | logger -t trino-worker-init) 2>&1
-
-# startup_code_version={startup_code_version}
-
-apt-get update -y
-apt-get install -y apt-transport-https ca-certificates curl gnupg-agent software-properties-common git jq unzip python3 apache2-utils
-
-# Azure CLI
-curl -sL https://aka.ms/InstallAzureCLIDeb | bash
-
-# Docker + Compose
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
-add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
-apt-get update -y && apt-get install -y docker-ce docker-ce-cli containerd.io
-curl -L "https://github.com/docker/compose/releases/download/v2.24.0/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-chmod +x /usr/local/bin/docker-compose
-
-# Fetch secrets from Key Vault using Managed Identity
-az login --identity
-SECRET_JSON=$(az keyvault secret show --vault-name {key_vault_name} --name {secret_id} --query value -o tsv)
-
-GIT_USER=$(echo "$SECRET_JSON" | jq -r '.git_deploy_username // "x-token-auth"')
-GIT_TOKEN=$(echo "$SECRET_JSON" | jq -r '.git_deploy_token')
-
-# Discover coordinator IP from blob storage (written by coordinator at boot)
-COORDINATOR_IP=""
-while [ -z "$COORDINATOR_IP" ]; do
-  echo "Waiting for coordinator IP in blob storage..."
-  az storage blob download \
-    --account-name "{sa_name}" \
-    --account-key "{sa_key}" \
-    --container-name "warehouse" \
-    --name "coordinator-ip.txt" \
-    --file /tmp/coordinator-ip.txt \
-    --overwrite 2>/dev/null || true
-  COORDINATOR_IP=$(tr -d '[:space:]' < /tmp/coordinator-ip.txt 2>/dev/null || true)
-  [ -z "$COORDINATOR_IP" ] && sleep 15
-done
-echo "Coordinator IP: $COORDINATOR_IP"
-
-# Clone repo
-REPO_URL="{git_repo_url}"
-REPO_PATH=$(echo "$REPO_URL" | sed 's,https://,,')
-git clone "https://$GIT_USER:$GIT_TOKEN@$REPO_PATH" /home/ubuntu/trino
-git -C /home/ubuntu/trino checkout {git_branch}
-git -C /home/ubuntu/trino rev-parse HEAD > /home/ubuntu/trino/.schema-version
-
-# Write .env from Key Vault secrets
-echo "$SECRET_JSON" | jq -r 'to_entries[] | .key + "=" + (.value | tostring)' > /home/ubuntu/trino/.env
-
-# Inject coordinator address and storage credentials
-echo "CATALOG_URL=http://$COORDINATOR_IP:19120/api/v2" >> /home/ubuntu/trino/.env
-echo "TRINO_DISCOVERY_URI=http://$COORDINATOR_IP:8080" >> /home/ubuntu/trino/.env
-echo "AZURE_STORAGE_ACCOUNT={sa_name}" >> /home/ubuntu/trino/.env
-echo "AZURE_STORAGE_KEY={sa_key}" >> /home/ubuntu/trino/.env
-echo "ICEBERG_WAREHOUSE_DIR=abfs://warehouse@{sa_name}.dfs.core.windows.net/" >> /home/ubuntu/trino/.env
-chmod 600 /home/ubuntu/trino/.env
-
-# Wait for coordinator to be ready
-until curl -sf "http://$COORDINATOR_IP:8080/v1/info" > /dev/null 2>&1; do
-  echo "Waiting for coordinator at $COORDINATOR_IP..."
-  sleep 10
-done
-
-# Generate Trino config files and start worker only
-cd /home/ubuntu/trino
-python3 config_generator.py envs_prod.json --env-file .env
-# Override discovery.uri in case config generator variable substitution fails
-sed -i "s|discovery.uri=.*|discovery.uri=http://$COORDINATOR_IP:8080|" trino/worker-config.properties
-docker-compose -f docker-compose.yml up -d --no-deps trino-worker
-"""
-    return base64.b64encode(script.encode()).decode()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Worker VMSS (capacity=worker_count) — discovers coordinator IP at boot
-# ─────────────────────────────────────────────────────────────────────────────
 worker_vmss = None
-if worker_count > 0:
-    worker_custom_data = pulumi.Output.all(
-        storage_account.name,
-        storage_key,
-    ).apply(lambda args: _build_worker_script(*args))
-
-    worker_vmss = azure_native.compute.VirtualMachineScaleSet(
-        f"{project_name}-worker-vmss{suffix}",
-        resource_group_name=resource_group,
-        vm_scale_set_name=f"{project_name}-worker-vmss{suffix}",
-        location=azure_location,
-        sku=azure_native.compute.SkuArgs(name=vm_size, capacity=worker_count, tier="Standard"),
-        identity=identity.id.apply(lambda iid: azure_native.compute.VirtualMachineScaleSetIdentityArgs(
-            type="UserAssigned",
-            user_assigned_identities={iid: {}},
-        )),
-        upgrade_policy=azure_native.compute.UpgradePolicyArgs(mode="Manual"),
-        virtual_machine_profile=azure_native.compute.VirtualMachineScaleSetVMProfileArgs(
-            os_profile=azure_native.compute.VirtualMachineScaleSetOSProfileArgs(
-                computer_name_prefix=f"{project_name[:7]}wk{suffix[:3] if suffix else ''}",
-                admin_username="ubuntu",
-                linux_configuration=azure_native.compute.LinuxConfigurationArgs(
-                    disable_password_authentication=True,
-                    ssh=azure_native.compute.SshConfigurationArgs(
-                        public_keys=[azure_native.compute.SshPublicKeyArgs(
-                            path="/home/ubuntu/.ssh/authorized_keys",
-                            key_data=ssh_public_key,
-                        )],
-                    ),
-                ),
-                custom_data=worker_custom_data,
-            ),
-            storage_profile=azure_native.compute.VirtualMachineScaleSetStorageProfileArgs(
-                image_reference=azure_native.compute.ImageReferenceArgs(
-                    publisher="Canonical",
-                    offer="0001-com-ubuntu-server-focal",
-                    sku="20_04-lts-gen2",
-                    version="latest",
-                ),
-                os_disk=azure_native.compute.VirtualMachineScaleSetOSDiskArgs(
-                    create_option="FromImage",
-                    disk_size_gb=volume_size,
-                    managed_disk=azure_native.compute.VirtualMachineScaleSetManagedDiskParametersArgs(
-                        storage_account_type="Premium_LRS",
-                    ),
-                ),
-            ),
-            network_profile=azure_native.compute.VirtualMachineScaleSetNetworkProfileArgs(
-                network_interface_configurations=[
-                    azure_native.compute.VirtualMachineScaleSetNetworkConfigurationArgs(
-                        name=f"{project_name}-worker-nic{suffix}",
-                        primary=True,
-                        ip_configurations=[
-                            azure_native.compute.VirtualMachineScaleSetIPConfigurationArgs(
-                                name=f"{project_name}-worker-ipconfig{suffix}",
-                                subnet=azure_native.compute.ApiEntityReferenceArgs(id=vm_subnet_id),
-                            )
-                        ],
-                        network_security_group=azure_native.network.SubResourceArgs(id=vm_nsg.id),
-                    )
-                ]
-            ),
-        ),
-        tags=tags,
-        opts=pulumi.ResourceOptions(
-            depends_on=[coordinator_vmss, kv_access],
-            replace_on_changes=["virtualMachineProfile"],
-            delete_before_replace=True,
-        ),
-    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Azure DNS — A record → App Gateway public IP
