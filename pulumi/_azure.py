@@ -412,7 +412,7 @@ echo "CATALOG_URL=http://${{DOCKER_GW}}:19120/api/v2" >> /home/ubuntu/trino/.env
 # Generate Trino config files and start coordinator only
 cd /home/ubuntu/trino
 python3 config_generator.py envs_prod.json --env-file .env
-docker-compose -f docker-compose.yml up -d trino-coordinator
+docker-compose -f docker-compose.yml up -d trino
 """
     return base64.b64encode(script.encode()).decode()
 
