@@ -647,7 +647,11 @@ if worker_count > 0:
             ),
         ),
         tags=tags,
-        opts=pulumi.ResourceOptions(depends_on=[coordinator_vmss, kv_access]),
+        opts=pulumi.ResourceOptions(
+            depends_on=[coordinator_vmss, kv_access],
+            replace_on_changes=["virtualMachineProfile"],
+            delete_before_replace=True,
+        ),
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
