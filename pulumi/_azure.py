@@ -413,7 +413,7 @@ echo "CATALOG_URL=http://$DOCKER_GW:19120/api/v2" >> /home/ubuntu/trino/.env
 # Generate Trino config and start coordinator + worker on the same VM
 cd /home/ubuntu/trino
 python3 config_generator.py envs_prod.json --env-file .env
-docker-compose -f docker-compose.yml up -d
+docker-compose -f docker-compose.yml up -d --scale trino-worker={worker_count}
 """
     return base64.b64encode(script.encode()).decode()
 
