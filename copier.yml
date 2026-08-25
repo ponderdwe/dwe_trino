@@ -110,8 +110,11 @@ _dwe_hub:
     - key: git_deploy_username
       description: "Git username for HTTPS clone (e.g. x-token-auth)"
       destination: secrets_manager
+    - key: NESSIE_DB_HOST
+      description: "PostgreSQL hostname for Nessie (e.g. myserver.postgres.database.azure.com)"
+      destination: secrets_manager
     - key: NESSIE_DB_PASS
-      description: "Nessie database password (used to create the PostgreSQL server when create_pg_cluster=true, or to authenticate when false)"
+      description: "Nessie database password"
       destination: secrets_manager
     - key: TRINO_USER
       description: "Trino admin username"
@@ -135,11 +138,8 @@ _dwe_hub:
       destination: secrets_manager
       cloud_provider: aws
   optional_secrets:
-    - key: NESSIE_DB_HOST
-      description: "Existing PostgreSQL hostname — required when create_pg_cluster=false"
-      destination: secrets_manager
     - key: NESSIE_DB_USER
-      description: "Existing PostgreSQL admin username — required when create_pg_cluster=false (defaults to 'nessie')"
+      description: "PostgreSQL username for Nessie (defaults to 'nessie')"
       destination: secrets_manager
     - key: DNS_ZONE_RESOURCE_GROUP
       description: "Resource group for DNS zone (defaults to RESOURCE_GROUP)"
@@ -230,13 +230,6 @@ worker_count:
   help: "Number of Trino worker nodes."
   x_dwe_editable: true
   x_dwe_per_env: true
-
-create_pg_cluster:
-  type: bool
-  default: true
-  help: "Create a managed PostgreSQL Flexible Server for Nessie. Set to false to use an existing cluster — provide NESSIE_DB_HOST and NESSIE_DB_USER in Key Vault."
-  x_dwe_editable: true
-  x_dwe_per_env: false
 
 secret_id:
   type: str

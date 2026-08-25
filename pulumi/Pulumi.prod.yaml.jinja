@@ -5,7 +5,6 @@ config:
   {{ project_name }}:instance_type: {{ instance_type }}
   {{ project_name }}:volume_size: "{{ volume_size }}"
   {{ project_name }}:worker_count: "{{ worker_count }}"
-  {{ project_name }}:create_pg_cluster: "{{ create_pg_cluster | lower }}"
 {% if cloud_provider == "azure" %}
   {{ project_name }}:azure_location: {{ azure_location }}
 {% else %}

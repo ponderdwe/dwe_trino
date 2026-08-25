@@ -45,7 +45,6 @@ resource_group    = config.require("resource_group")
 subscription_id   = config.require("subscription_id")
 app_port          = 8080
 startup_code_version = config.get("startup_code_version") or ""
-create_pg_cluster = (config.get("create_pg_cluster") or "true").lower() == "true"
 
 suffix       = f"-{env}" if env != "prod" else ""
 nessie_db_name = f"nessie_{env}"
@@ -97,10 +96,11 @@ for _key in ("TRINO_USER", "TRINO_PASSWORD", "TRINO_SHARED_SECRET"):
     if not secrets.get(_key):
         raise ValueError(f"Required secret '{_key}' missing from Key Vault secret {secret_id}")
 
-# ── Nessie DB password ────────────────────────────────────────────────────────
-nessie_db_pass = secrets.get("NESSIE_DB_PASS", "")
-if create_pg_cluster and not nessie_db_pass:
-    raise ValueError("NESSIE_DB_PASS required in Key Vault when create_pg_cluster=true")
+# ── Nessie DB credentials ─────────────────────────────────────────────────────
+for _key in ("NESSIE_DB_HOST", "NESSIE_DB_PASS"):
+    if not secrets.get(_key):
+        raise ValueError(f"Required secret '{_key}' missing from Key Vault secret {secret_id}")
+nessie_db_pass = secrets["NESSIE_DB_PASS"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # User-assigned Managed Identity (used by VMSS to read Key Vault)
@@ -128,53 +128,17 @@ kv_access = azure_native.authorization.RoleAssignment(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PostgreSQL backend for Nessie — either Pulumi-managed or pre-existing
+# PostgreSQL database for Nessie — created in the existing cluster
 # ─────────────────────────────────────────────────────────────────────────────
-pg_server = None
-if create_pg_cluster:
-    pg_server_name = f"{project_name}-pg{suffix}"
-    pg_server = pg.FlexibleServer(
-        pg_server_name,
-        resource_group_name=resource_group,
-        server_name=pg_server_name,
-        location=azure_location,
-        sku=pg.SkuArgs(name="Standard_B1ms", tier="Burstable"),
-        administrator_login="nessie",
-        administrator_login_password=nessie_db_pass,
-        version="14",
-        storage=pg.StorageArgs(storage_size_gb=32),
-        backup=pg.BackupArgs(backup_retention_days=7, geo_redundant_backup="Disabled"),
-        high_availability=pg.HighAvailabilityArgs(mode="Disabled"),
-        tags=tags,
-    )
-    pg.FirewallRule(
-        f"{project_name}-pg-fw{suffix}",
-        resource_group_name=resource_group,
-        server_name=pg_server.name,
-        firewall_rule_name="AllowAzureServices",
-        start_ip_address="0.0.0.0",
-        end_ip_address="0.0.0.0",
-    )
-    pg.Database(
-        f"{project_name}-pg-db{suffix}",
-        resource_group_name=resource_group,
-        server_name=pg_server.name,
-        database_name=nessie_db_name,
-    )
-    nessie_db_user = "nessie"
-    pg_fqdn_output = pg_server.fully_qualified_domain_name
-else:
-    nessie_db_host = secrets.get("NESSIE_DB_HOST", "")
-    nessie_db_user = secrets.get("NESSIE_DB_USER", "nessie")
-    if not nessie_db_host:
-        raise ValueError("NESSIE_DB_HOST required in Key Vault when create_pg_cluster=false")
-    pg_fqdn_output = pulumi.Output.from_input(nessie_db_host)
-    pg.Database(
-        f"{project_name}-pg-db{suffix}",
-        resource_group_name=resource_group,
-        server_name=nessie_db_host.split(".")[0],
-        database_name=nessie_db_name,
-    )
+nessie_db_host = secrets["NESSIE_DB_HOST"]
+nessie_db_user = secrets.get("NESSIE_DB_USER", "nessie")
+pg_fqdn_output = pulumi.Output.from_input(nessie_db_host)
+pg.Database(
+    f"{project_name}-pg-db{suffix}",
+    resource_group_name=resource_group,
+    server_name=nessie_db_host.split(".")[0],
+    database_name=nessie_db_name,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Azure Storage Account + Blob Container (Nessie Iceberg warehouse, ADLS Gen2)
@@ -669,7 +633,7 @@ coordinator_vmss = azure_native.compute.VirtualMachineScaleSet(
     ),
     tags=tags,
     opts=pulumi.ResourceOptions(
-        depends_on=[app_gw, coordinator_ilb, kv_access, storage_account] + ([pg_server] if pg_server else [])
+        depends_on=[app_gw, coordinator_ilb, kv_access, storage_account]
     ),
 )
 
@@ -895,5 +859,4 @@ pulumi.export("public_ip",              public_ip.ip_address)
 pulumi.export("environment",             env)
 if worker_vmss:
     pulumi.export("worker_vmss_name",    worker_vmss.name)
-if pg_server:
-    pulumi.export("pg_server_fqdn",      pg_server.fully_qualified_domain_name)
+pulumi.export("pg_server_fqdn",          pg_fqdn_output)
