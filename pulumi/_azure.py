@@ -567,7 +567,7 @@ done
 # Generate Trino config files and start worker only
 cd /home/ubuntu/trino
 python3 config_generator.py envs_prod.json --env-file .env
-docker-compose -f docker-compose.yml up -d trino-worker
+docker-compose -f docker-compose.yml up -d --no-deps trino-worker
 """
     return base64.b64encode(script.encode()).decode()
 
