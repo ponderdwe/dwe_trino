@@ -435,6 +435,17 @@ python3 config_generator.py envs_prod.json --env-file .env
 # Override discovery.uri in case config generator variable substitution fails
 sed -i "s|discovery.uri=.*|discovery.uri=http://$COORDINATOR_IP:8080|" trino/coordinator-config.properties trino/worker-config.properties
 docker-compose -f docker-compose.yml up -d trino
+
+# Publish coordinator IP to blob storage so workers can discover it without RBAC
+echo "$COORDINATOR_IP" > /tmp/coordinator-ip.txt
+az storage blob upload \
+  --account-name "{sa_name}" \
+  --account-key "{sa_key}" \
+  --container-name "warehouse" \
+  --name "coordinator-ip.txt" \
+  --file /tmp/coordinator-ip.txt \
+  --overwrite
+echo "Published coordinator IP $COORDINATOR_IP to blob storage"
 """
     return base64.b64encode(script.encode()).decode()
 
@@ -518,11 +529,9 @@ coordinator_vmss = azure_native.compute.VirtualMachineScaleSet(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Worker startup script — Trino worker only, discovers coordinator IP at boot
-# via az vmss nic list (no ILB needed)
+# Worker startup script — Trino worker only, discovers coordinator IP via blob
 # ─────────────────────────────────────────────────────────────────────────────
 def _build_worker_script(sa_name: str, sa_key: str) -> str:
-    coordinator_vmss_name = f"{project_name}-coordinator-vmss{suffix}"
     script = f"""#!/bin/bash
 set -e
 exec > >(tee /var/log/trino-worker-init.log | logger -t trino-worker-init) 2>&1
@@ -549,16 +558,18 @@ SECRET_JSON=$(az keyvault secret show --vault-name {key_vault_name} --name {secr
 GIT_USER=$(echo "$SECRET_JSON" | jq -r '.git_deploy_username // "x-token-auth"')
 GIT_TOKEN=$(echo "$SECRET_JSON" | jq -r '.git_deploy_token')
 
-# Discover coordinator private IP from coordinator VMSS NIC
-COORDINATOR_VMSS="{coordinator_vmss_name}"
+# Discover coordinator IP from blob storage (written by coordinator at boot)
 COORDINATOR_IP=""
 while [ -z "$COORDINATOR_IP" ]; do
-  echo "Waiting for coordinator VMSS NIC..."
-  az account get-access-token --resource https://management.azure.com/ --force-refresh > /dev/null 2>&1 || true
-  COORDINATOR_IP=$(az vmss nic list \\
-    --resource-group {resource_group} \\
-    --vmss-name "$COORDINATOR_VMSS" \\
-    --query "[0].ipConfigurations[0].privateIPAddress" -o tsv 2>/dev/null || true)
+  echo "Waiting for coordinator IP in blob storage..."
+  az storage blob download \
+    --account-name "{sa_name}" \
+    --account-key "{sa_key}" \
+    --container-name "warehouse" \
+    --name "coordinator-ip.txt" \
+    --file /tmp/coordinator-ip.txt \
+    --overwrite 2>/dev/null || true
+  COORDINATOR_IP=$(tr -d '[:space:]' < /tmp/coordinator-ip.txt 2>/dev/null || true)
   [ -z "$COORDINATOR_IP" ] && sleep 15
 done
 echo "Coordinator IP: $COORDINATOR_IP"
