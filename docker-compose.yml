@@ -25,6 +25,7 @@ services:
   trino-worker:
     image: trinodb/trino:471
     restart: unless-stopped
+    network_mode: host
     depends_on:
       trino:
         condition: service_healthy

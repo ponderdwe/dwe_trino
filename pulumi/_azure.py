@@ -386,6 +386,10 @@ echo "NESSIE_DB_USER={nessie_db_user}" >> /home/ubuntu/trino/.env
 echo "AZURE_STORAGE_ACCOUNT={sa_name}" >> /home/ubuntu/trino/.env
 echo "AZURE_STORAGE_KEY={sa_key}" >> /home/ubuntu/trino/.env
 echo "ICEBERG_WAREHOUSE_DIR=abfs://warehouse@{sa_name}.dfs.core.windows.net/" >> /home/ubuntu/trino/.env
+
+# Use the VM's own private IP as discovery URI so external workers can reach it
+COORDINATOR_IP=$(hostname -I | awk '{{print $1}}')
+echo "TRINO_DISCOVERY_URI=http://$COORDINATOR_IP:8080" >> /home/ubuntu/trino/.env
 chmod 600 /home/ubuntu/trino/.env
 
 # Start Nessie on host network so it's reachable by Trino coordinator container
@@ -412,6 +416,8 @@ echo "CATALOG_URL=http://${{DOCKER_GW}}:19120/api/v2" >> /home/ubuntu/trino/.env
 # Generate Trino config files and start coordinator only
 cd /home/ubuntu/trino
 python3 config_generator.py envs_prod.json --env-file .env
+# Override discovery.uri in case config generator variable substitution fails
+sed -i "s|discovery.uri=.*|discovery.uri=http://$COORDINATOR_IP:8080|" trino/coordinator-config.properties trino/worker-config.properties
 docker-compose -f docker-compose.yml up -d trino
 """
     return base64.b64encode(script.encode()).decode()
@@ -567,6 +573,8 @@ done
 # Generate Trino config files and start worker only
 cd /home/ubuntu/trino
 python3 config_generator.py envs_prod.json --env-file .env
+# Override discovery.uri in case config generator variable substitution fails
+sed -i "s|discovery.uri=.*|discovery.uri=http://$COORDINATOR_IP:8080|" trino/worker-config.properties
 docker-compose -f docker-compose.yml up -d --no-deps trino-worker
 """
     return base64.b64encode(script.encode()).decode()
