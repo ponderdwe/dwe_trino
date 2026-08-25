@@ -72,15 +72,6 @@ app_gw_subnet_id = secrets["APP_GW_SUBNET_ID"]
 vm_subnet_id     = secrets["VM_SUBNET_ID"]
 ssh_public_key   = secrets["SSH_PUBLIC_KEY"]
 
-# Look up the VM subnet CIDR to restrict the App Gateway NSG
-_vm_parts = vm_subnet_id.split("/")
-_vm_subnet_info = azure_native.network.get_subnet_output(
-    resource_group_name=_vm_parts[4],
-    virtual_network_name=_vm_parts[-3],
-    subnet_name=_vm_parts[-1],
-)
-vm_subnet_cidr = _vm_subnet_info.address_prefix
-
 # ── Networking / DNS ──────────────────────────────────────────────────────────
 dns_zone_name   = secrets["DNS_ZONE_NAME"]
 dns_record_name = secrets["DNS_RECORD_NAME"]
@@ -185,51 +176,6 @@ public_ip = azure_native.network.PublicIPAddress(
 # ─────────────────────────────────────────────────────────────────────────────
 # Network Security Groups
 # ─────────────────────────────────────────────────────────────────────────────
-app_gw_nsg = azure_native.network.NetworkSecurityGroup(
-    f"{project_name}-appgw-nsg{suffix}",
-    resource_group_name=resource_group,
-    location=azure_location,
-    network_security_group_name=f"{project_name}-appgw-nsg{suffix}",
-    security_rules=[
-        azure_native.network.SecurityRuleArgs(
-            name="AllowHTTP",
-            priority=100, direction="Inbound", access="Allow", protocol="Tcp",
-            source_port_range="*", destination_port_range="80",
-            source_address_prefix=vm_subnet_cidr, destination_address_prefix="*",
-        ),
-        azure_native.network.SecurityRuleArgs(
-            name="AllowHTTPS",
-            priority=110, direction="Inbound", access="Allow", protocol="Tcp",
-            source_port_range="*", destination_port_range="443",
-            source_address_prefix=vm_subnet_cidr, destination_address_prefix="*",
-        ),
-        azure_native.network.SecurityRuleArgs(
-            name="AllowGatewayManager",
-            priority=120, direction="Inbound", access="Allow", protocol="Tcp",
-            source_port_range="*", destination_port_range="65200-65535",
-            source_address_prefix="GatewayManager", destination_address_prefix="*",
-        ),
-    ],
-    tags=tags,
-)
-
-# Associate App Gateway NSG with the pre-existing App Gateway subnet
-_agw_parts       = app_gw_subnet_id.split("/")
-_agw_existing    = azure_native.network.get_subnet_output(
-    resource_group_name=_agw_parts[4],
-    virtual_network_name=_agw_parts[-3],
-    subnet_name=_agw_parts[-1],
-)
-azure_native.network.Subnet(
-    f"{project_name}-appgw-subnet{suffix}",
-    resource_group_name=_agw_parts[4],
-    virtual_network_name=_agw_parts[-3],
-    subnet_name=_agw_parts[-1],
-    address_prefix=_agw_existing.address_prefix,
-    network_security_group=azure_native.network.NetworkSecurityGroupArgs(id=app_gw_nsg.id),
-    opts=pulumi.ResourceOptions(depends_on=[app_gw_nsg]),
-)
-
 vm_nsg = azure_native.network.NetworkSecurityGroup(
     f"{project_name}-vm-nsg{suffix}",
     resource_group_name=resource_group,
@@ -475,7 +421,7 @@ app_gw = azure_native.network.ApplicationGateway(
     ssl_certificates=ssl_certs,
     redirect_configurations=redirect_configurations,
     tags=tags,
-    opts=pulumi.ResourceOptions(depends_on=[public_ip, kv_access]),
+    opts=pulumi.ResourceOptions(depends_on=[public_ip, kv_access, vm_nsg]),
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
