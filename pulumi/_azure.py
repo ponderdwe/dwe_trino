@@ -1,9 +1,11 @@
 """
 DWE Trino Infrastructure — Azure Pulumi IaC
-Provisions: Application Gateway (HTTP→HTTPS) + VMSS + Azure DNS
+Provisions: PostgreSQL + Storage Account (Nessie) + Internal LB +
+            App Gateway + Coordinator VMSS + Worker VMSS + DNS
 
-Single-instance VMSS (stateful — Trino needs persistent storage).
-Rolling reimage via VMSS reimage: new instance boots, old terminates.
+Coordinator VM: runs Nessie catalog + Trino coordinator
+Worker VMs:     run Trino workers (N instances, connect to coordinator via internal LB)
+
 Run with: pulumi stack select prod && pulumi up --yes
 """
 
@@ -13,6 +15,7 @@ from pathlib import Path
 
 import pulumi
 import pulumi_azure_native as azure_native
+import pulumi_azure_native.dbforpostgresql.v20221201 as pg
 import yaml
 from azure.identity import DefaultAzureCredential
 from azure.keyvault.secrets import SecretClient
@@ -24,6 +27,7 @@ _dwe = yaml.safe_load((Path(__file__).parent / "dwe-hydration.yaml").read_text()
 project_name    = _dwe["project_name"]
 git_repo_url    = _dwe["git_repo_url"]
 adapter_version = _dwe["adapter_version"]
+adapter_name    = _dwe["adapter_name"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stack Config
@@ -41,8 +45,10 @@ resource_group    = config.require("resource_group")
 subscription_id   = config.require("subscription_id")
 app_port          = 8080
 startup_code_version = config.get("startup_code_version") or ""
+create_pg_cluster = (config.get("create_pg_cluster") or "true").lower() == "true"
 
-suffix = f"-{env}" if env != "prod" else ""
+suffix       = f"-{env}" if env != "prod" else ""
+nessie_db_name = f"nessie_{env}"
 tags = {
     "Project":     project_name,
     "ManagedBy":   "Pulumi",
@@ -61,37 +67,40 @@ def get_secret(kv_name: str, sid: str) -> dict:
 
 secrets = get_secret(key_vault_name, secret_id)
 
-# Read iceberg output secret for shared infrastructure values (subnet, storage)
-_iceberg_meta: dict = {}
-try:
-    _iceberg_meta = get_secret(key_vault_name, f"iceberg-metadata-{env}-output")
-except Exception:
-    pass
-
 # ── Infrastructure ────────────────────────────────────────────────────────────
-vnet_id            = secrets["VNET_ID"]
-app_gw_subnet_id   = secrets["APP_GW_SUBNET_ID"]
-vm_subnet_id       = _iceberg_meta.get("VM_SUBNET_ID") or secrets.get("VM_SUBNET_ID", "")
-if not vm_subnet_id:
-    raise ValueError("VM_SUBNET_ID not found in iceberg-metadata output secret or Key Vault secret")
-ssh_public_key     = secrets["SSH_PUBLIC_KEY"]
+vnet_id          = secrets["VNET_ID"]
+app_gw_subnet_id = secrets["APP_GW_SUBNET_ID"]
+vm_subnet_id     = secrets["VM_SUBNET_ID"]
+ssh_public_key   = secrets["SSH_PUBLIC_KEY"]
+
+# Look up the VM subnet CIDR to restrict the App Gateway NSG
+_vm_parts = vm_subnet_id.split("/")
+_vm_subnet_info = azure_native.network.get_subnet_output(
+    resource_group_name=_vm_parts[4],
+    virtual_network_name=_vm_parts[-3],
+    subnet_name=_vm_parts[-1],
+)
+vm_subnet_cidr = _vm_subnet_info.address_prefix
 
 # ── Networking / DNS ──────────────────────────────────────────────────────────
-dns_zone_name      = secrets["DNS_ZONE_NAME"]
-dns_record_name    = secrets["DNS_RECORD_NAME"]
-dns_zone_rg        = secrets.get("DNS_ZONE_RESOURCE_GROUP", resource_group)
-ssl_cert_kv_id     = secrets.get("APP_GW_SSL_CERT_KEY_VAULT_ID", "")
+dns_zone_name   = secrets["DNS_ZONE_NAME"]
+dns_record_name = secrets["DNS_RECORD_NAME"]
+dns_zone_rg     = secrets.get("DNS_ZONE_RESOURCE_GROUP", resource_group)
+ssl_cert_kv_id  = secrets.get("APP_GW_SSL_CERT_KEY_VAULT_ID", "")
 
 # ── Git ───────────────────────────────────────────────────────────────────────
 git_deploy_token    = secrets["git_deploy_token"]
 git_deploy_username = secrets.get("git_deploy_username", "x-token-auth")
 
-# ── Trino runtime ─────────────────────────────────────────────────────────────
-# Individual values are not used in Python — config_generator.py reads them
-# from .env on the VM. Validate presence here to catch missing secrets early.
-for _key in ("CATALOG_URL", "ICEBERG_WAREHOUSE_DIR", "TRINO_USER", "TRINO_PASSWORD", "TRINO_SHARED_SECRET"):
+# ── Trino runtime — validate required secrets ─────────────────────────────────
+for _key in ("TRINO_USER", "TRINO_PASSWORD", "TRINO_SHARED_SECRET"):
     if not secrets.get(_key):
         raise ValueError(f"Required secret '{_key}' missing from Key Vault secret {secret_id}")
+
+# ── Nessie DB password ────────────────────────────────────────────────────────
+nessie_db_pass = secrets.get("NESSIE_DB_PASS", "")
+if create_pg_cluster and not nessie_db_pass:
+    raise ValueError("NESSIE_DB_PASS required in Key Vault when create_pg_cluster=true")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # User-assigned Managed Identity (used by VMSS to read Key Vault)
@@ -104,8 +113,6 @@ identity = azure_native.managedidentity.UserAssignedIdentity(
     tags=tags,
 )
 
-# Key Vault Secrets User role assignment for the Managed Identity (RBAC-enabled vault)
-# Role: Key Vault Secrets User (4633458b-17de-408a-b874-0445c86b69e6)
 kv_access = azure_native.authorization.RoleAssignment(
     f"{project_name}-kv-role{suffix}",
     scope=pulumi.Output.format(
@@ -119,6 +126,84 @@ kv_access = azure_native.authorization.RoleAssignment(
     principal_id=identity.principal_id,
     principal_type="ServicePrincipal",
 )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PostgreSQL backend for Nessie — either Pulumi-managed or pre-existing
+# ─────────────────────────────────────────────────────────────────────────────
+pg_server = None
+if create_pg_cluster:
+    pg_server_name = f"{project_name}-pg{suffix}"
+    pg_server = pg.FlexibleServer(
+        pg_server_name,
+        resource_group_name=resource_group,
+        server_name=pg_server_name,
+        location=azure_location,
+        sku=pg.SkuArgs(name="Standard_B1ms", tier="Burstable"),
+        administrator_login="nessie",
+        administrator_login_password=nessie_db_pass,
+        version="14",
+        storage=pg.StorageArgs(storage_size_gb=32),
+        backup=pg.BackupArgs(backup_retention_days=7, geo_redundant_backup="Disabled"),
+        high_availability=pg.HighAvailabilityArgs(mode="Disabled"),
+        tags=tags,
+    )
+    pg.FirewallRule(
+        f"{project_name}-pg-fw{suffix}",
+        resource_group_name=resource_group,
+        server_name=pg_server.name,
+        firewall_rule_name="AllowAzureServices",
+        start_ip_address="0.0.0.0",
+        end_ip_address="0.0.0.0",
+    )
+    pg.Database(
+        f"{project_name}-pg-db{suffix}",
+        resource_group_name=resource_group,
+        server_name=pg_server.name,
+        database_name=nessie_db_name,
+    )
+    nessie_db_user = "nessie"
+    pg_fqdn_output = pg_server.fully_qualified_domain_name
+else:
+    nessie_db_host = secrets.get("NESSIE_DB_HOST", "")
+    nessie_db_user = secrets.get("NESSIE_DB_USER", "nessie")
+    if not nessie_db_host:
+        raise ValueError("NESSIE_DB_HOST required in Key Vault when create_pg_cluster=false")
+    pg_fqdn_output = pulumi.Output.from_input(nessie_db_host)
+    pg.Database(
+        f"{project_name}-pg-db{suffix}",
+        resource_group_name=resource_group,
+        server_name=nessie_db_host.split(".")[0],
+        database_name=nessie_db_name,
+    )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Azure Storage Account + Blob Container (Nessie Iceberg warehouse, ADLS Gen2)
+# ─────────────────────────────────────────────────────────────────────────────
+sa_env_suffix        = env if env != "prod" else ""
+storage_account_name = (project_name.replace("-", "") + "nessie" + sa_env_suffix)[:24]
+
+storage_account = azure_native.storage.StorageAccount(
+    f"{project_name}-sa{suffix}",
+    resource_group_name=resource_group,
+    account_name=storage_account_name,
+    location=azure_location,
+    sku=azure_native.storage.SkuArgs(name="Standard_LRS"),
+    kind="StorageV2",
+    is_hns_enabled=True,
+    tags=tags,
+)
+
+azure_native.storage.BlobContainer(
+    f"{project_name}-warehouse{suffix}",
+    resource_group_name=resource_group,
+    account_name=storage_account.name,
+    container_name="warehouse",
+)
+
+storage_key = azure_native.storage.list_storage_account_keys_output(
+    resource_group_name=resource_group,
+    account_name=storage_account.name,
+).apply(lambda r: r.keys[0].value)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Public IP for Application Gateway
@@ -146,13 +231,13 @@ app_gw_nsg = azure_native.network.NetworkSecurityGroup(
             name="AllowHTTP",
             priority=100, direction="Inbound", access="Allow", protocol="Tcp",
             source_port_range="*", destination_port_range="80",
-            source_address_prefix="*", destination_address_prefix="*",
+            source_address_prefix=vm_subnet_cidr, destination_address_prefix="*",
         ),
         azure_native.network.SecurityRuleArgs(
             name="AllowHTTPS",
             priority=110, direction="Inbound", access="Allow", protocol="Tcp",
             source_port_range="*", destination_port_range="443",
-            source_address_prefix="*", destination_address_prefix="*",
+            source_address_prefix=vm_subnet_cidr, destination_address_prefix="*",
         ),
         azure_native.network.SecurityRuleArgs(
             name="AllowGatewayManager",
@@ -164,6 +249,23 @@ app_gw_nsg = azure_native.network.NetworkSecurityGroup(
     tags=tags,
 )
 
+# Associate App Gateway NSG with the pre-existing App Gateway subnet
+_agw_parts       = app_gw_subnet_id.split("/")
+_agw_existing    = azure_native.network.get_subnet_output(
+    resource_group_name=_agw_parts[4],
+    virtual_network_name=_agw_parts[-3],
+    subnet_name=_agw_parts[-1],
+)
+azure_native.network.Subnet(
+    f"{project_name}-appgw-subnet{suffix}",
+    resource_group_name=_agw_parts[4],
+    virtual_network_name=_agw_parts[-3],
+    subnet_name=_agw_parts[-1],
+    address_prefix=_agw_existing.address_prefix,
+    network_security_group=azure_native.network.NetworkSecurityGroupArgs(id=app_gw_nsg.id),
+    opts=pulumi.ResourceOptions(depends_on=[app_gw_nsg]),
+)
+
 vm_nsg = azure_native.network.NetworkSecurityGroup(
     f"{project_name}-vm-nsg{suffix}",
     resource_group_name=resource_group,
@@ -171,14 +273,20 @@ vm_nsg = azure_native.network.NetworkSecurityGroup(
     network_security_group_name=f"{project_name}-vm-nsg{suffix}",
     security_rules=[
         azure_native.network.SecurityRuleArgs(
-            name="AllowAppPort",
+            name="AllowTrino",
             priority=100, direction="Inbound", access="Allow", protocol="Tcp",
             source_port_range="*", destination_port_range=str(app_port),
             source_address_prefix="VirtualNetwork", destination_address_prefix="*",
         ),
         azure_native.network.SecurityRuleArgs(
-            name="AllowSSH",
+            name="AllowNessie",
             priority=110, direction="Inbound", access="Allow", protocol="Tcp",
+            source_port_range="*", destination_port_range="19120",
+            source_address_prefix="VirtualNetwork", destination_address_prefix="*",
+        ),
+        azure_native.network.SecurityRuleArgs(
+            name="AllowSSH",
+            priority=120, direction="Inbound", access="Allow", protocol="Tcp",
             source_port_range="*", destination_port_range="22",
             source_address_prefix="VirtualNetwork", destination_address_prefix="*",
         ),
@@ -187,8 +295,93 @@ vm_nsg = azure_native.network.NetworkSecurityGroup(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Application Gateway (HTTP→HTTPS redirect + HTTPS→VMSS backend)
-# Internal sub-resource IDs are constructed from known config values.
+# Internal Load Balancer — stable private address for coordinator
+# Workers use this IP to discover Trino coordinator and reach Nessie
+# ─────────────────────────────────────────────────────────────────────────────
+ilb_name   = f"{project_name}-coordinator-ilb{suffix}"
+ilb_prefix = (
+    f"/subscriptions/{subscription_id}/resourceGroups/{resource_group}"
+    f"/providers/Microsoft.Network/loadBalancers/{ilb_name}"
+)
+
+coordinator_ilb = azure_native.network.LoadBalancer(
+    ilb_name,
+    resource_group_name=resource_group,
+    load_balancer_name=ilb_name,
+    location=azure_location,
+    sku=azure_native.network.LoadBalancerSkuArgs(name="Standard"),
+    frontend_ip_configurations=[
+        azure_native.network.FrontendIPConfigurationArgs(
+            name="coordinator-frontend",
+            subnet=azure_native.network.SubResourceArgs(id=vm_subnet_id),
+            private_ip_allocation_method="Dynamic",
+        )
+    ],
+    backend_address_pools=[
+        azure_native.network.BackendAddressPoolArgs(name="coordinator-backend")
+    ],
+    probes=[
+        azure_native.network.ProbeArgs(
+            name="trino-probe",
+            protocol="Http",
+            port=app_port,
+            request_path="/v1/info",
+            interval_in_seconds=30,
+            number_of_probes=3,
+        ),
+        azure_native.network.ProbeArgs(
+            name="nessie-probe",
+            protocol="Tcp",
+            port=19120,
+            interval_in_seconds=30,
+            number_of_probes=3,
+        ),
+    ],
+    load_balancing_rules=[
+        azure_native.network.LoadBalancingRuleArgs(
+            name="trino-rule",
+            frontend_ip_configuration=azure_native.network.SubResourceArgs(
+                id=f"{ilb_prefix}/frontendIPConfigurations/coordinator-frontend"
+            ),
+            backend_address_pool=azure_native.network.SubResourceArgs(
+                id=f"{ilb_prefix}/backendAddressPools/coordinator-backend"
+            ),
+            probe=azure_native.network.SubResourceArgs(
+                id=f"{ilb_prefix}/probes/trino-probe"
+            ),
+            protocol="Tcp",
+            frontend_port=app_port,
+            backend_port=app_port,
+            idle_timeout_in_minutes=4,
+            enable_floating_ip=False,
+        ),
+        azure_native.network.LoadBalancingRuleArgs(
+            name="nessie-rule",
+            frontend_ip_configuration=azure_native.network.SubResourceArgs(
+                id=f"{ilb_prefix}/frontendIPConfigurations/coordinator-frontend"
+            ),
+            backend_address_pool=azure_native.network.SubResourceArgs(
+                id=f"{ilb_prefix}/backendAddressPools/coordinator-backend"
+            ),
+            probe=azure_native.network.SubResourceArgs(
+                id=f"{ilb_prefix}/probes/nessie-probe"
+            ),
+            protocol="Tcp",
+            frontend_port=19120,
+            backend_port=19120,
+            idle_timeout_in_minutes=4,
+            enable_floating_ip=False,
+        ),
+    ],
+    tags=tags,
+)
+
+coordinator_ilb_ip = coordinator_ilb.frontend_ip_configurations.apply(
+    lambda confs: confs[0].private_ip_address
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Application Gateway (HTTP→HTTPS redirect + HTTPS→coordinator backend)
 # ─────────────────────────────────────────────────────────────────────────────
 app_gw_name = f"{project_name}-appgw{suffix}"
 ag_prefix = (
@@ -239,8 +432,7 @@ if has_ssl:
     routing_rules = [
         azure_native.network.ApplicationGatewayRequestRoutingRuleArgs(
             name="http-redirect",
-            priority=10,
-            rule_type="Basic",
+            priority=10, rule_type="Basic",
             http_listener=azure_native.network.SubResourceArgs(
                 id=f"{ag_prefix}/httpListeners/http-listener"),
             redirect_configuration=azure_native.network.SubResourceArgs(
@@ -248,8 +440,7 @@ if has_ssl:
         ),
         azure_native.network.ApplicationGatewayRequestRoutingRuleArgs(
             name="https-route",
-            priority=20,
-            rule_type="Basic",
+            priority=20, rule_type="Basic",
             http_listener=azure_native.network.SubResourceArgs(
                 id=f"{ag_prefix}/httpListeners/https-listener"),
             backend_address_pool=azure_native.network.SubResourceArgs(
@@ -262,8 +453,7 @@ else:
     routing_rules = [
         azure_native.network.ApplicationGatewayRequestRoutingRuleArgs(
             name="http-route",
-            priority=10,
-            rule_type="Basic",
+            priority=10, rule_type="Basic",
             http_listener=azure_native.network.SubResourceArgs(
                 id=f"{ag_prefix}/httpListeners/http-listener"),
             backend_address_pool=azure_native.network.SubResourceArgs(
@@ -273,7 +463,6 @@ else:
         )
     ]
 
-# App Gateway identity for Key Vault cert access
 ag_identity = identity.id.apply(lambda iid: azure_native.network.ManagedServiceIdentityArgs(
     type="UserAssigned",
     user_assigned_identities={iid: {}},
@@ -285,10 +474,7 @@ app_gw = azure_native.network.ApplicationGateway(
     application_gateway_name=app_gw_name,
     location=azure_location,
     sku=azure_native.network.ApplicationGatewaySkuArgs(
-        name="Standard_v2",
-        tier="Standard_v2",
-        capacity=1,
-    ),
+        name="Standard_v2", tier="Standard_v2", capacity=1),
     identity=ag_identity,
     gateway_ip_configurations=[azure_native.network.ApplicationGatewayIPConfigurationArgs(
         name="appGatewayIpConfig",
@@ -308,22 +494,17 @@ app_gw = azure_native.network.ApplicationGateway(
     backend_http_settings_collection=[
         azure_native.network.ApplicationGatewayBackendHttpSettingsArgs(
             name="backendHttpSettings",
-            port=app_port,
-            protocol="Http",
+            port=app_port, protocol="Http",
             cookie_based_affinity="Disabled",
             request_timeout=600,
-            probe=azure_native.network.SubResourceArgs(
-                id=f"{ag_prefix}/probes/healthProbe"),
+            probe=azure_native.network.SubResourceArgs(id=f"{ag_prefix}/probes/healthProbe"),
         )
     ],
     probes=[azure_native.network.ApplicationGatewayProbeArgs(
         name="healthProbe",
-        protocol="Http",
-        host="127.0.0.1",
+        protocol="Http", host="127.0.0.1",
         path="/v1/info",
-        interval=30,
-        timeout=10,
-        unhealthy_threshold=3,
+        interval=30, timeout=10, unhealthy_threshold=3,
     )],
     http_listeners=http_listeners,
     request_routing_rules=routing_rules,
@@ -334,10 +515,10 @@ app_gw = azure_native.network.ApplicationGateway(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# VMSS user data — install Docker, clone repo, write .env from Key Vault
-# Production: explicit -f docker-compose.yml so the override file is NOT merged
+# Coordinator startup script — Nessie (host network) + Trino coordinator
 # ─────────────────────────────────────────────────────────────────────────────
-user_data_script = f"""#!/bin/bash
+def _build_coordinator_script(pg_fqdn: str, sa_name: str, sa_key: str) -> str:
+    script = f"""#!/bin/bash
 set -e
 exec > >(tee /var/log/trino-init.log | logger -t trino-init) 2>&1
 
@@ -362,46 +543,69 @@ SECRET_JSON=$(az keyvault secret show --vault-name {key_vault_name} --name {secr
 
 GIT_USER=$(echo "$SECRET_JSON" | jq -r '.git_deploy_username // "x-token-auth"')
 GIT_TOKEN=$(echo "$SECRET_JSON" | jq -r '.git_deploy_token')
+NESSIE_DB_PASS=$(echo "$SECRET_JSON" | jq -r '.NESSIE_DB_PASS')
 
-# Clone repo with credentials injected into URL
+# Clone repo
 REPO_URL="{git_repo_url}"
 REPO_PATH=$(echo "$REPO_URL" | sed 's,https://,,')
 git clone "https://$GIT_USER:$GIT_TOKEN@$REPO_PATH" /home/ubuntu/trino
 git -C /home/ubuntu/trino checkout {git_branch}
 git -C /home/ubuntu/trino rev-parse HEAD > /home/ubuntu/trino/.schema-version
 
-# Write .env from all Key Vault secret key=value pairs
+# Write .env from Key Vault secrets
 echo "$SECRET_JSON" | jq -r 'to_entries[] | .key + "=" + (.value | tostring)' > /home/ubuntu/trino/.env
 
-# Merge iceberg catalog storage credentials if the output secret exists
-ICEBERG_META=$(az keyvault secret show --vault-name {key_vault_name} --name iceberg-metadata-{env}-output --query value -o tsv 2>/dev/null || true)
-if [ -n "$ICEBERG_META" ]; then
-  echo "$ICEBERG_META" | jq -r 'to_entries[] | .key + "=" + (.value | tostring)' >> /home/ubuntu/trino/.env
-fi
+# Inject Pulumi-provisioned infrastructure values
+echo "NESSIE_DB_URL=jdbc:postgresql://{pg_fqdn}:5432/{nessie_db_name}" >> /home/ubuntu/trino/.env
+echo "NESSIE_DB_USER={nessie_db_user}" >> /home/ubuntu/trino/.env
+echo "AZURE_STORAGE_ACCOUNT={sa_name}" >> /home/ubuntu/trino/.env
+echo "AZURE_STORAGE_KEY={sa_key}" >> /home/ubuntu/trino/.env
+echo "ICEBERG_WAREHOUSE_DIR=abfs://warehouse@{sa_name}.dfs.core.windows.net/" >> /home/ubuntu/trino/.env
 chmod 600 /home/ubuntu/trino/.env
 
-# Generate Trino config files (coordinator-config.properties, iceberg.properties, password.db)
+# Start Nessie on host network so it's reachable by Trino coordinator container
+docker run -d \\
+  --name nessie \\
+  --restart unless-stopped \\
+  --network host \\
+  -e QUARKUS_DATASOURCE_JDBC_URL="jdbc:postgresql://{pg_fqdn}:5432/{nessie_db_name}" \\
+  -e QUARKUS_DATASOURCE_USERNAME="{nessie_db_user}" \\
+  -e QUARKUS_DATASOURCE_PASSWORD="$NESSIE_DB_PASS" \\
+  -e NESSIE_VERSION_STORE_TYPE=JDBC \\
+  projectnessie/nessie
+
+# Wait for Nessie to be ready
+until curl -sf http://localhost:19120/api/v2/config > /dev/null 2>&1; do
+  echo "Waiting for Nessie..."
+  sleep 5
+done
+
+# Trino coordinator reaches Nessie via the docker0 bridge gateway (host network)
+DOCKER_GW=$(ip -4 addr show docker0 2>/dev/null | grep 'inet ' | awk '{{print $2}}' | cut -d/ -f1 || echo "172.17.0.1")
+echo "CATALOG_URL=http://${{DOCKER_GW}}:19120/api/v2" >> /home/ubuntu/trino/.env
+
+# Generate Trino config files and start coordinator only
 cd /home/ubuntu/trino
 python3 config_generator.py envs_prod.json --env-file .env
-
-# Use explicit file so docker-compose.override.yml (local dev) is NOT merged
-docker-compose -f docker-compose.yml up -d --scale trino-worker={worker_count}
+docker-compose -f docker-compose.yml up -d trino-coordinator
 """
-custom_data = base64.b64encode(user_data_script.encode()).decode()
+    return base64.b64encode(script.encode()).decode()
+
+coordinator_custom_data = pulumi.Output.all(
+    pg_fqdn_output,
+    storage_account.name,
+    storage_key,
+).apply(lambda args: _build_coordinator_script(*args))
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Virtual Machine Scale Set (min=max=1 — stateful, single instance)
+# Coordinator VMSS (capacity=1) — App Gateway backend + ILB backend
 # ─────────────────────────────────────────────────────────────────────────────
-vmss = azure_native.compute.VirtualMachineScaleSet(
-    f"{project_name}-vmss{suffix}",
+coordinator_vmss = azure_native.compute.VirtualMachineScaleSet(
+    f"{project_name}-coordinator-vmss{suffix}",
     resource_group_name=resource_group,
-    vm_scale_set_name=f"{project_name}-vmss{suffix}",
+    vm_scale_set_name=f"{project_name}-coordinator-vmss{suffix}",
     location=azure_location,
-    sku=azure_native.compute.SkuArgs(
-        name=vm_size,
-        capacity=1,
-        tier="Standard",
-    ),
+    sku=azure_native.compute.SkuArgs(name=vm_size, capacity=1, tier="Standard"),
     identity=identity.id.apply(lambda iid: azure_native.compute.VirtualMachineScaleSetIdentityArgs(
         type="UserAssigned",
         user_assigned_identities={iid: {}},
@@ -409,7 +613,7 @@ vmss = azure_native.compute.VirtualMachineScaleSet(
     upgrade_policy=azure_native.compute.UpgradePolicyArgs(mode="Manual"),
     virtual_machine_profile=azure_native.compute.VirtualMachineScaleSetVMProfileArgs(
         os_profile=azure_native.compute.VirtualMachineScaleSetOSProfileArgs(
-            computer_name_prefix=f"{project_name[:9]}{suffix[:3] if suffix else ''}",
+            computer_name_prefix=f"{project_name[:7]}co{suffix[:3] if suffix else ''}",
             admin_username="ubuntu",
             linux_configuration=azure_native.compute.LinuxConfigurationArgs(
                 disable_password_authentication=True,
@@ -420,7 +624,7 @@ vmss = azure_native.compute.VirtualMachineScaleSet(
                     )],
                 ),
             ),
-            custom_data=custom_data,
+            custom_data=coordinator_custom_data,
         ),
         storage_profile=azure_native.compute.VirtualMachineScaleSetStorageProfileArgs(
             image_reference=azure_native.compute.ImageReferenceArgs(
@@ -440,15 +644,20 @@ vmss = azure_native.compute.VirtualMachineScaleSet(
         network_profile=azure_native.compute.VirtualMachineScaleSetNetworkProfileArgs(
             network_interface_configurations=[
                 azure_native.compute.VirtualMachineScaleSetNetworkConfigurationArgs(
-                    name=f"{project_name}-nic{suffix}",
+                    name=f"{project_name}-coordinator-nic{suffix}",
                     primary=True,
                     ip_configurations=[
                         azure_native.compute.VirtualMachineScaleSetIPConfigurationArgs(
-                            name=f"{project_name}-ipconfig{suffix}",
+                            name=f"{project_name}-coordinator-ipconfig{suffix}",
                             subnet=azure_native.compute.ApiEntityReferenceArgs(id=vm_subnet_id),
                             application_gateway_backend_address_pools=[
                                 azure_native.network.SubResourceArgs(
                                     id=f"{ag_prefix}/backendAddressPools/backendPool"
+                                )
+                            ],
+                            load_balancer_backend_address_pools=[
+                                azure_native.network.SubResourceArgs(
+                                    id=f"{ilb_prefix}/backendAddressPools/coordinator-backend"
                                 )
                             ],
                         )
@@ -459,8 +668,143 @@ vmss = azure_native.compute.VirtualMachineScaleSet(
         ),
     ),
     tags=tags,
-    opts=pulumi.ResourceOptions(depends_on=[app_gw, kv_access]),
+    opts=pulumi.ResourceOptions(
+        depends_on=[app_gw, coordinator_ilb, kv_access, storage_account] + ([pg_server] if pg_server else [])
+    ),
 )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Worker startup script — Trino worker only, connects to coordinator via ILB
+# ─────────────────────────────────────────────────────────────────────────────
+def _build_worker_script(coordinator_ip: str, sa_name: str, sa_key: str) -> str:
+    script = f"""#!/bin/bash
+set -e
+exec > >(tee /var/log/trino-worker-init.log | logger -t trino-worker-init) 2>&1
+
+# startup_code_version={startup_code_version}
+
+apt-get update -y
+apt-get install -y apt-transport-https ca-certificates curl gnupg-agent software-properties-common git jq unzip python3 apache2-utils
+
+# Azure CLI
+curl -sL https://aka.ms/InstallAzureCLIDeb | bash
+
+# Docker + Compose
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
+add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+apt-get update -y && apt-get install -y docker-ce docker-ce-cli containerd.io
+curl -L "https://github.com/docker/compose/releases/download/v2.24.0/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+chmod +x /usr/local/bin/docker-compose
+
+# Fetch secrets from Key Vault using Managed Identity
+az login --identity
+SECRET_JSON=$(az keyvault secret show --vault-name {key_vault_name} --name {secret_id} --query value -o tsv)
+
+GIT_USER=$(echo "$SECRET_JSON" | jq -r '.git_deploy_username // "x-token-auth"')
+GIT_TOKEN=$(echo "$SECRET_JSON" | jq -r '.git_deploy_token')
+
+# Clone repo
+REPO_URL="{git_repo_url}"
+REPO_PATH=$(echo "$REPO_URL" | sed 's,https://,,')
+git clone "https://$GIT_USER:$GIT_TOKEN@$REPO_PATH" /home/ubuntu/trino
+git -C /home/ubuntu/trino checkout {git_branch}
+git -C /home/ubuntu/trino rev-parse HEAD > /home/ubuntu/trino/.schema-version
+
+# Write .env from Key Vault secrets
+echo "$SECRET_JSON" | jq -r 'to_entries[] | .key + "=" + (.value | tostring)' > /home/ubuntu/trino/.env
+
+# Inject coordinator address and storage credentials
+echo "CATALOG_URL=http://{coordinator_ip}:19120/api/v2" >> /home/ubuntu/trino/.env
+echo "TRINO_DISCOVERY_URI=http://{coordinator_ip}:8080" >> /home/ubuntu/trino/.env
+echo "AZURE_STORAGE_ACCOUNT={sa_name}" >> /home/ubuntu/trino/.env
+echo "AZURE_STORAGE_KEY={sa_key}" >> /home/ubuntu/trino/.env
+echo "ICEBERG_WAREHOUSE_DIR=abfs://warehouse@{sa_name}.dfs.core.windows.net/" >> /home/ubuntu/trino/.env
+chmod 600 /home/ubuntu/trino/.env
+
+# Wait for coordinator to be ready
+until curl -sf http://{coordinator_ip}:8080/v1/info > /dev/null 2>&1; do
+  echo "Waiting for coordinator at {coordinator_ip}..."
+  sleep 10
+done
+
+# Generate Trino config files and start worker only
+cd /home/ubuntu/trino
+python3 config_generator.py envs_prod.json --env-file .env
+docker-compose -f docker-compose.yml up -d trino-worker
+"""
+    return base64.b64encode(script.encode()).decode()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Worker VMSS (capacity=worker_count) — no App Gateway, no ILB backend
+# ─────────────────────────────────────────────────────────────────────────────
+worker_vmss = None
+if worker_count > 0:
+    worker_custom_data = pulumi.Output.all(
+        coordinator_ilb_ip,
+        storage_account.name,
+        storage_key,
+    ).apply(lambda args: _build_worker_script(*args))
+
+    worker_vmss = azure_native.compute.VirtualMachineScaleSet(
+        f"{project_name}-worker-vmss{suffix}",
+        resource_group_name=resource_group,
+        vm_scale_set_name=f"{project_name}-worker-vmss{suffix}",
+        location=azure_location,
+        sku=azure_native.compute.SkuArgs(name=vm_size, capacity=worker_count, tier="Standard"),
+        identity=identity.id.apply(lambda iid: azure_native.compute.VirtualMachineScaleSetIdentityArgs(
+            type="UserAssigned",
+            user_assigned_identities={iid: {}},
+        )),
+        upgrade_policy=azure_native.compute.UpgradePolicyArgs(mode="Manual"),
+        virtual_machine_profile=azure_native.compute.VirtualMachineScaleSetVMProfileArgs(
+            os_profile=azure_native.compute.VirtualMachineScaleSetOSProfileArgs(
+                computer_name_prefix=f"{project_name[:7]}wk{suffix[:3] if suffix else ''}",
+                admin_username="ubuntu",
+                linux_configuration=azure_native.compute.LinuxConfigurationArgs(
+                    disable_password_authentication=True,
+                    ssh=azure_native.compute.SshConfigurationArgs(
+                        public_keys=[azure_native.compute.SshPublicKeyArgs(
+                            path="/home/ubuntu/.ssh/authorized_keys",
+                            key_data=ssh_public_key,
+                        )],
+                    ),
+                ),
+                custom_data=worker_custom_data,
+            ),
+            storage_profile=azure_native.compute.VirtualMachineScaleSetStorageProfileArgs(
+                image_reference=azure_native.compute.ImageReferenceArgs(
+                    publisher="Canonical",
+                    offer="0001-com-ubuntu-server-focal",
+                    sku="20_04-lts-gen2",
+                    version="latest",
+                ),
+                os_disk=azure_native.compute.VirtualMachineScaleSetOSDiskArgs(
+                    create_option="FromImage",
+                    disk_size_gb=volume_size,
+                    managed_disk=azure_native.compute.VirtualMachineScaleSetManagedDiskParametersArgs(
+                        storage_account_type="Premium_LRS",
+                    ),
+                ),
+            ),
+            network_profile=azure_native.compute.VirtualMachineScaleSetNetworkProfileArgs(
+                network_interface_configurations=[
+                    azure_native.compute.VirtualMachineScaleSetNetworkConfigurationArgs(
+                        name=f"{project_name}-worker-nic{suffix}",
+                        primary=True,
+                        ip_configurations=[
+                            azure_native.compute.VirtualMachineScaleSetIPConfigurationArgs(
+                                name=f"{project_name}-worker-ipconfig{suffix}",
+                                subnet=azure_native.compute.ApiEntityReferenceArgs(id=vm_subnet_id),
+                            )
+                        ],
+                        network_security_group=azure_native.network.SubResourceArgs(id=vm_nsg.id),
+                    )
+                ]
+            ),
+        ),
+        tags=tags,
+        opts=pulumi.ResourceOptions(depends_on=[coordinator_vmss, kv_access]),
+    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Azure DNS — A record → App Gateway public IP
@@ -494,9 +838,10 @@ if _kg_host and _kg_token and _kg_mappings:
     _kg_services   = _kg_mappings.get("services", [])
 
     _pulumi_export_map = {
-        "url":        pulumi.Output.from_input(f"https://{dns_record_name}.{dns_zone_name}"),
-        "appgw_name": app_gw.name,
-        "vmss_name":  vmss.name,
+        "url":                  pulumi.Output.from_input(f"https://{dns_record_name}.{dns_zone_name}"),
+        "appgw_name":           app_gw.name,
+        "coordinator_vmss_name": coordinator_vmss.name,
+        "worker_vmss_name":     worker_vmss.name if worker_vmss else pulumi.Output.from_input(""),
     }
     _out_names = list(_kg_outputs.keys())
     _out_vals  = [_pulumi_export_map.get(_kg_outputs[n], pulumi.Output.from_input("")) for n in _out_names]
@@ -541,8 +886,14 @@ if _kg_host and _kg_token and _kg_mappings:
 # ─────────────────────────────────────────────────────────────────────────────
 # Outputs
 # ─────────────────────────────────────────────────────────────────────────────
-pulumi.export("appgw_name",  app_gw.name)
-pulumi.export("vmss_name",   vmss.name)
-pulumi.export("url",         f"https://{dns_record_name}.{dns_zone_name}")
-pulumi.export("public_ip",   public_ip.ip_address)
-pulumi.export("environment", env)
+pulumi.export("appgw_name",              app_gw.name)
+pulumi.export("coordinator_vmss_name",   coordinator_vmss.name)
+pulumi.export("coordinator_ilb_ip",      coordinator_ilb_ip)
+pulumi.export("storage_account_name",    storage_account.name)
+pulumi.export("url",                     f"https://{dns_record_name}.{dns_zone_name}")
+pulumi.export("public_ip",              public_ip.ip_address)
+pulumi.export("environment",             env)
+if worker_vmss:
+    pulumi.export("worker_vmss_name",    worker_vmss.name)
+if pg_server:
+    pulumi.export("pg_server_fqdn",      pg_server.fully_qualified_domain_name)

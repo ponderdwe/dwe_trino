@@ -1,7 +1,7 @@
 _dwe_hub:
   hub_name: trino
   display_name: "Trino Query Engine"
-  description: "Trino coordinator + worker, connected to dwe_iceberg_catalog (Nessie) via CATALOG_URL"
+  description: "Trino coordinator (with co-located Nessie Iceberg catalog) + worker nodes, self-contained deployment"
   icon: "database"
   git_providers:
     - github
@@ -24,12 +24,14 @@ _dwe_hub:
         trigger_secret: DNS_ZONE_NAME
         properties:
           hostname: DNS_RECORD_NAME
-  depends_on:
-    - iceberg_catalog
+  depends_on: []
   kg_pulumi_outputs:
     url: url
     appgw_name: appgw_name
-    vmss_name: vmss_name
+    coordinator_vmss_name: coordinator_vmss_name
+    worker_vmss_name: worker_vmss_name
+    coordinator_ilb_ip: coordinator_ilb_ip
+    storage_account_name: storage_account_name
   ci_templates:
     github: ci-templates/github.yaml
     gitlab: ci-templates/gitlab.yaml
@@ -108,11 +110,8 @@ _dwe_hub:
     - key: git_deploy_username
       description: "Git username for HTTPS clone (e.g. x-token-auth)"
       destination: secrets_manager
-    - key: CATALOG_URL
-      description: "Nessie catalog URL from dwe_iceberg_catalog deployment (e.g. https://catalog.myorg.com)"
-      destination: secrets_manager
-    - key: ICEBERG_WAREHOUSE_DIR
-      description: "Iceberg warehouse location. Azure: abfs://warehouse@<storage_account>.dfs.core.windows.net/. AWS: s3://<bucket>/warehouse"
+    - key: NESSIE_DB_PASS
+      description: "Nessie database password (used to create the PostgreSQL server when create_pg_cluster=true, or to authenticate when false)"
       destination: secrets_manager
     - key: TRINO_USER
       description: "Trino admin username"
@@ -123,10 +122,6 @@ _dwe_hub:
     - key: TRINO_SHARED_SECRET
       description: "Shared secret for Trino internal communication (generate with: openssl rand -hex 32)"
       destination: secrets_manager
-    - key: AZURE_STORAGE_KEY
-      description: "Azure storage account access key for Iceberg warehouse (cloud_provider=azure)"
-      destination: secrets_manager
-      cloud_provider: azure
     - key: S3_REGION
       description: "AWS region for S3 Iceberg warehouse (cloud_provider=aws)"
       destination: secrets_manager
@@ -140,6 +135,12 @@ _dwe_hub:
       destination: secrets_manager
       cloud_provider: aws
   optional_secrets:
+    - key: NESSIE_DB_HOST
+      description: "Existing PostgreSQL hostname — required when create_pg_cluster=false"
+      destination: secrets_manager
+    - key: NESSIE_DB_USER
+      description: "Existing PostgreSQL admin username — required when create_pg_cluster=false (defaults to 'nessie')"
+      destination: secrets_manager
     - key: DNS_ZONE_RESOURCE_GROUP
       description: "Resource group for DNS zone (defaults to RESOURCE_GROUP)"
       destination: secrets_manager
@@ -229,6 +230,13 @@ worker_count:
   help: "Number of Trino worker nodes."
   x_dwe_editable: true
   x_dwe_per_env: true
+
+create_pg_cluster:
+  type: bool
+  default: true
+  help: "Create a managed PostgreSQL Flexible Server for Nessie. Set to false to use an existing cluster — provide NESSIE_DB_HOST and NESSIE_DB_USER in Key Vault."
+  x_dwe_editable: true
+  x_dwe_per_env: false
 
 secret_id:
   type: str
