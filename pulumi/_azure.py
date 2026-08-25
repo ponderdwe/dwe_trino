@@ -118,6 +118,22 @@ kv_access = azure_native.authorization.RoleAssignment(
     principal_type="ServicePrincipal",
 )
 
+# Reader on resource group — needed so worker VMs can call az vmss nic list
+# to discover the coordinator's private IP at boot time
+rg_reader = azure_native.authorization.RoleAssignment(
+    f"{project_name}-rg-reader{suffix}",
+    scope=pulumi.Output.format(
+        "/subscriptions/{0}/resourceGroups/{1}",
+        subscription_id, resource_group,
+    ),
+    role_definition_id=pulumi.Output.format(
+        "/subscriptions/{0}/providers/Microsoft.Authorization/roleDefinitions/acdd72a7-3385-48ef-bd42-f606fba81ae7",
+        subscription_id,
+    ),
+    principal_id=identity.principal_id,
+    principal_type="ServicePrincipal",
+)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PostgreSQL database for Nessie — created in the existing cluster
 # ─────────────────────────────────────────────────────────────────────────────
@@ -538,6 +554,7 @@ COORDINATOR_VMSS="{coordinator_vmss_name}"
 COORDINATOR_IP=""
 while [ -z "$COORDINATOR_IP" ]; do
   echo "Waiting for coordinator VMSS NIC..."
+  az account get-access-token --resource https://management.azure.com/ --force-refresh > /dev/null 2>&1 || true
   COORDINATOR_IP=$(az vmss nic list \\
     --resource-group {resource_group} \\
     --vmss-name "$COORDINATOR_VMSS" \\
