@@ -30,7 +30,6 @@ _dwe_hub:
     appgw_name: appgw_name
     coordinator_vmss_name: coordinator_vmss_name
     worker_vmss_name: worker_vmss_name
-    coordinator_ilb_ip: coordinator_ilb_ip
     storage_account_name: storage_account_name
   ci_templates:
     github: ci-templates/github.yaml

@@ -1,10 +1,10 @@
 """
 DWE Trino Infrastructure — Azure Pulumi IaC
-Provisions: PostgreSQL + Storage Account (Nessie) + Internal LB +
+Provisions: PostgreSQL + Storage Account (Nessie) +
             App Gateway + Coordinator VMSS + Worker VMSS + DNS
 
 Coordinator VM: runs Nessie catalog + Trino coordinator
-Worker VMs:     run Trino workers (N instances, connect to coordinator via internal LB)
+Worker VMs:     run Trino workers (N instances, discover coordinator IP via az vmss nic list)
 
 Run with: pulumi stack select prod && pulumi up --yes
 """
@@ -202,92 +202,6 @@ vm_nsg = azure_native.network.NetworkSecurityGroup(
         ),
     ],
     tags=tags,
-)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Internal Load Balancer — stable private address for coordinator
-# Workers use this IP to discover Trino coordinator and reach Nessie
-# ─────────────────────────────────────────────────────────────────────────────
-ilb_name   = f"{project_name}-coordinator-ilb{suffix}"
-ilb_prefix = (
-    f"/subscriptions/{subscription_id}/resourceGroups/{resource_group}"
-    f"/providers/Microsoft.Network/loadBalancers/{ilb_name}"
-)
-
-coordinator_ilb = azure_native.network.LoadBalancer(
-    ilb_name,
-    resource_group_name=resource_group,
-    load_balancer_name=ilb_name,
-    location=azure_location,
-    sku=azure_native.network.LoadBalancerSkuArgs(name="Standard"),
-    frontend_ip_configurations=[
-        azure_native.network.FrontendIPConfigurationArgs(
-            name="coordinator-frontend",
-            subnet=azure_native.network.SubResourceArgs(id=vm_subnet_id),
-            private_ip_allocation_method="Dynamic",
-        )
-    ],
-    backend_address_pools=[
-        azure_native.network.BackendAddressPoolArgs(name="coordinator-backend")
-    ],
-    probes=[
-        azure_native.network.ProbeArgs(
-            name="trino-probe",
-            protocol="Http",
-            port=app_port,
-            request_path="/v1/info",
-            interval_in_seconds=30,
-            number_of_probes=3,
-        ),
-        azure_native.network.ProbeArgs(
-            name="nessie-probe",
-            protocol="Tcp",
-            port=19120,
-            interval_in_seconds=30,
-            number_of_probes=3,
-        ),
-    ],
-    load_balancing_rules=[
-        azure_native.network.LoadBalancingRuleArgs(
-            name="trino-rule",
-            frontend_ip_configuration=azure_native.network.SubResourceArgs(
-                id=f"{ilb_prefix}/frontendIPConfigurations/coordinator-frontend"
-            ),
-            backend_address_pool=azure_native.network.SubResourceArgs(
-                id=f"{ilb_prefix}/backendAddressPools/coordinator-backend"
-            ),
-            probe=azure_native.network.SubResourceArgs(
-                id=f"{ilb_prefix}/probes/trino-probe"
-            ),
-            protocol="Tcp",
-            frontend_port=app_port,
-            backend_port=app_port,
-            idle_timeout_in_minutes=4,
-            enable_floating_ip=False,
-        ),
-        azure_native.network.LoadBalancingRuleArgs(
-            name="nessie-rule",
-            frontend_ip_configuration=azure_native.network.SubResourceArgs(
-                id=f"{ilb_prefix}/frontendIPConfigurations/coordinator-frontend"
-            ),
-            backend_address_pool=azure_native.network.SubResourceArgs(
-                id=f"{ilb_prefix}/backendAddressPools/coordinator-backend"
-            ),
-            probe=azure_native.network.SubResourceArgs(
-                id=f"{ilb_prefix}/probes/nessie-probe"
-            ),
-            protocol="Tcp",
-            frontend_port=19120,
-            backend_port=19120,
-            idle_timeout_in_minutes=4,
-            enable_floating_ip=False,
-        ),
-    ],
-    tags=tags,
-)
-
-coordinator_ilb_ip = coordinator_ilb.frontend_ip_configurations.apply(
-    lambda confs: confs[0].private_ip_address
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -508,7 +422,7 @@ coordinator_custom_data = pulumi.Output.all(
 ).apply(lambda args: _build_coordinator_script(*args))
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Coordinator VMSS (capacity=1) — App Gateway backend + ILB backend
+# Coordinator VMSS (capacity=1) — App Gateway backend
 # ─────────────────────────────────────────────────────────────────────────────
 coordinator_vmss = azure_native.compute.VirtualMachineScaleSet(
     f"{project_name}-coordinator-vmss{suffix}",
@@ -565,11 +479,6 @@ coordinator_vmss = azure_native.compute.VirtualMachineScaleSet(
                                     id=f"{ag_prefix}/backendAddressPools/backendPool"
                                 )
                             ],
-                            load_balancer_backend_address_pools=[
-                                azure_native.network.SubResourceArgs(
-                                    id=f"{ilb_prefix}/backendAddressPools/coordinator-backend"
-                                )
-                            ],
                         )
                     ],
                     network_security_group=azure_native.network.SubResourceArgs(id=vm_nsg.id),
@@ -579,14 +488,16 @@ coordinator_vmss = azure_native.compute.VirtualMachineScaleSet(
     ),
     tags=tags,
     opts=pulumi.ResourceOptions(
-        depends_on=[app_gw, coordinator_ilb, kv_access, storage_account]
+        depends_on=[app_gw, kv_access, storage_account]
     ),
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Worker startup script — Trino worker only, connects to coordinator via ILB
+# Worker startup script — Trino worker only, discovers coordinator IP at boot
+# via az vmss nic list (no ILB needed)
 # ─────────────────────────────────────────────────────────────────────────────
-def _build_worker_script(coordinator_ip: str, sa_name: str, sa_key: str) -> str:
+def _build_worker_script(sa_name: str, sa_key: str) -> str:
+    coordinator_vmss_name = f"{project_name}-coordinator-vmss{suffix}"
     script = f"""#!/bin/bash
 set -e
 exec > >(tee /var/log/trino-worker-init.log | logger -t trino-worker-init) 2>&1
@@ -613,6 +524,19 @@ SECRET_JSON=$(az keyvault secret show --vault-name {key_vault_name} --name {secr
 GIT_USER=$(echo "$SECRET_JSON" | jq -r '.git_deploy_username // "x-token-auth"')
 GIT_TOKEN=$(echo "$SECRET_JSON" | jq -r '.git_deploy_token')
 
+# Discover coordinator private IP from coordinator VMSS NIC
+COORDINATOR_VMSS="{coordinator_vmss_name}"
+COORDINATOR_IP=""
+while [ -z "$COORDINATOR_IP" ]; do
+  echo "Waiting for coordinator VMSS NIC..."
+  COORDINATOR_IP=$(az vmss nic list \\
+    --resource-group {resource_group} \\
+    --vmss-name "$COORDINATOR_VMSS" \\
+    --query "[0].ipConfigurations[0].privateIPAddress" -o tsv 2>/dev/null || true)
+  [ -z "$COORDINATOR_IP" ] && sleep 15
+done
+echo "Coordinator IP: $COORDINATOR_IP"
+
 # Clone repo
 REPO_URL="{git_repo_url}"
 REPO_PATH=$(echo "$REPO_URL" | sed 's,https://,,')
@@ -624,16 +548,16 @@ git -C /home/ubuntu/trino rev-parse HEAD > /home/ubuntu/trino/.schema-version
 echo "$SECRET_JSON" | jq -r 'to_entries[] | .key + "=" + (.value | tostring)' > /home/ubuntu/trino/.env
 
 # Inject coordinator address and storage credentials
-echo "CATALOG_URL=http://{coordinator_ip}:19120/api/v2" >> /home/ubuntu/trino/.env
-echo "TRINO_DISCOVERY_URI=http://{coordinator_ip}:8080" >> /home/ubuntu/trino/.env
+echo "CATALOG_URL=http://$COORDINATOR_IP:19120/api/v2" >> /home/ubuntu/trino/.env
+echo "TRINO_DISCOVERY_URI=http://$COORDINATOR_IP:8080" >> /home/ubuntu/trino/.env
 echo "AZURE_STORAGE_ACCOUNT={sa_name}" >> /home/ubuntu/trino/.env
 echo "AZURE_STORAGE_KEY={sa_key}" >> /home/ubuntu/trino/.env
 echo "ICEBERG_WAREHOUSE_DIR=abfs://warehouse@{sa_name}.dfs.core.windows.net/" >> /home/ubuntu/trino/.env
 chmod 600 /home/ubuntu/trino/.env
 
 # Wait for coordinator to be ready
-until curl -sf http://{coordinator_ip}:8080/v1/info > /dev/null 2>&1; do
-  echo "Waiting for coordinator at {coordinator_ip}..."
+until curl -sf "http://$COORDINATOR_IP:8080/v1/info" > /dev/null 2>&1; do
+  echo "Waiting for coordinator at $COORDINATOR_IP..."
   sleep 10
 done
 
@@ -645,12 +569,11 @@ docker-compose -f docker-compose.yml up -d trino-worker
     return base64.b64encode(script.encode()).decode()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Worker VMSS (capacity=worker_count) — no App Gateway, no ILB backend
+# Worker VMSS (capacity=worker_count) — discovers coordinator IP at boot
 # ─────────────────────────────────────────────────────────────────────────────
 worker_vmss = None
 if worker_count > 0:
     worker_custom_data = pulumi.Output.all(
-        coordinator_ilb_ip,
         storage_account.name,
         storage_key,
     ).apply(lambda args: _build_worker_script(*args))
@@ -798,7 +721,6 @@ if _kg_host and _kg_token and _kg_mappings:
 # ─────────────────────────────────────────────────────────────────────────────
 pulumi.export("appgw_name",              app_gw.name)
 pulumi.export("coordinator_vmss_name",   coordinator_vmss.name)
-pulumi.export("coordinator_ilb_ip",      coordinator_ilb_ip)
 pulumi.export("storage_account_name",    storage_account.name)
 pulumi.export("url",                     f"https://{dns_record_name}.{dns_zone_name}")
 pulumi.export("public_ip",              public_ip.ip_address)
