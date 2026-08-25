@@ -347,6 +347,7 @@ set -e
 exec > >(tee /var/log/trino-init.log | logger -t trino-init) 2>&1
 
 # startup_code_version={startup_code_version}
+echo "Starting coordinator init"
 
 apt-get update -y
 apt-get install -y apt-transport-https ca-certificates curl gnupg-agent software-properties-common git jq unzip python3 apache2-utils
@@ -488,7 +489,9 @@ coordinator_vmss = azure_native.compute.VirtualMachineScaleSet(
     ),
     tags=tags,
     opts=pulumi.ResourceOptions(
-        depends_on=[app_gw, kv_access, storage_account]
+        depends_on=[app_gw, kv_access, storage_account],
+        replace_on_changes=["virtualMachineProfile"],
+        delete_before_replace=True,
     ),
 )
 
