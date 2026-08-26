@@ -15,6 +15,12 @@ import boto3  # used only by Pulumi at deploy time (not EC2 bootstrap)
 import pulumi
 import pulumi_aws as aws
 import yaml
+from _startup import (
+    clone_repo,
+    generate_config_and_start,
+    install_packages_and_docker,
+    write_env_from_secret_json,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Hydration config — written by dwe-core at create-service / update-service time
@@ -155,55 +161,31 @@ ubuntu_ami = aws.ec2.get_ami(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# User data — install Docker, clone repo, write .env from Secrets Manager
-# Production: explicit -f docker-compose.yml so override file is NOT merged
+# User data — cloud-agnostic sections from _startup.py + AWS-specific pieces
 # ─────────────────────────────────────────────────────────────────────────────
-user_data_script = f"""#!/bin/bash
-set -e
-exec > >(tee /var/log/trino-init.log | logger -t trino-init) 2>&1
+_user_data_sections = [
+    f"#!/bin/bash\nset -e\nexec > >(tee /var/log/trino-init.log | logger -t trino-init) 2>&1\n\n# startup_code_version={startup_code_version}",
 
-# startup_code_version={startup_code_version}
+    install_packages_and_docker(),
 
-apt-get update -y
-apt-get install -y apt-transport-https ca-certificates curl gnupg-agent software-properties-common git jq unzip python3 apache2-utils
-
-# AWS CLI v2 (EC2 IAM role provides credentials — no keys needed)
+    # ── AWS-specific: CLI + Secrets Manager fetch ─────────────────────────────
+    f"""# AWS CLI v2 (EC2 IAM role provides credentials — no keys needed)
 curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip
 unzip -q /tmp/awscliv2.zip -d /tmp
 /tmp/aws/install
 
-# Docker + Compose
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
-add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
-apt-get update -y && apt-get install -y docker-ce docker-ce-cli containerd.io
-curl -L "https://github.com/docker/compose/releases/download/v2.24.0/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-chmod +x /usr/local/bin/docker-compose
-
 # Fetch all secrets from AWS Secrets Manager
 SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id {secret_id} --region {aws_region} --query SecretString --output text)
-
 GIT_USER=$(echo "$SECRET_JSON" | jq -r '.git_deploy_username // "x-token-auth"')
-GIT_TOKEN=$(echo "$SECRET_JSON" | jq -r '.git_deploy_token')
+GIT_TOKEN=$(echo "$SECRET_JSON" | jq -r '.git_deploy_token')""",
 
-# Clone repo with credentials injected into URL
-REPO_URL="{git_repo_url}"
-REPO_PATH=$(echo "$REPO_URL" | sed 's,https://,,')
-git clone "https://$GIT_USER:$GIT_TOKEN@$REPO_PATH" /home/ubuntu/trino
-git -C /home/ubuntu/trino checkout {git_branch}
-git -C /home/ubuntu/trino rev-parse HEAD > /home/ubuntu/trino/.schema-version
+    clone_repo(git_repo_url, git_branch),
 
-# Write .env from all Secrets Manager key=value pairs
-echo "$SECRET_JSON" | jq -r 'to_entries[] | .key + "=" + (.value | tostring)' > /home/ubuntu/trino/.env
-chmod 600 /home/ubuntu/trino/.env
+    write_env_from_secret_json(),
 
-# Generate Trino config files (coordinator-config.properties, iceberg.properties, password.db)
-cd /home/ubuntu/trino
-python3 config_generator.py envs_prod.json --env-file .env
-
-# Use explicit file so docker-compose.override.yml (local dev) is NOT merged
-docker-compose -f docker-compose.yml up -d --scale trino-worker={worker_count}
-"""
-user_data = base64.b64encode(user_data_script.encode()).decode()
+    generate_config_and_start(worker_count),
+]
+user_data = base64.b64encode("\n\n".join(_user_data_sections).encode()).decode()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Launch Template

@@ -14,6 +14,12 @@ import json
 from pathlib import Path
 
 import pulumi
+from _startup import (
+    clone_repo,
+    generate_config_and_start,
+    install_packages_and_docker,
+    write_env_from_secret_json,
+)
 import pulumi_azure_native as azure_native
 import pulumi_azure_native.dbforpostgresql.v20221201 as pg
 import yaml
@@ -343,54 +349,35 @@ app_gw = azure_native.network.ApplicationGateway(
 # Coordinator startup script — Nessie (host network) + Trino coordinator
 # ─────────────────────────────────────────────────────────────────────────────
 def _build_coordinator_script(pg_fqdn: str, sa_name: str, sa_key: str) -> str:
-    script = f"""#!/bin/bash
-set -e
-exec > >(tee /var/log/trino-init.log | logger -t trino-init) 2>&1
+    sections = [
+        f"#!/bin/bash\nset -e\nexec > >(tee /var/log/trino-init.log | logger -t trino-init) 2>&1\n\n# startup_code_version={startup_code_version}\necho 'Starting coordinator init'",
 
-# startup_code_version={startup_code_version}
-echo "Starting coordinator init"
+        install_packages_and_docker(),
 
-apt-get update -y
-apt-get install -y apt-transport-https ca-certificates curl gnupg-agent software-properties-common git jq unzip python3 apache2-utils
-
-# Azure CLI
+        # ── Azure-specific: CLI + Key Vault secret fetch ──────────────────────
+        f"""# Azure CLI
 curl -sL https://aka.ms/InstallAzureCLIDeb | bash
-
-# Docker + Compose
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
-add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
-apt-get update -y && apt-get install -y docker-ce docker-ce-cli containerd.io
-curl -L "https://github.com/docker/compose/releases/download/v2.24.0/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-chmod +x /usr/local/bin/docker-compose
 
 # Fetch secrets from Key Vault using Managed Identity
 az login --identity
 SECRET_JSON=$(az keyvault secret show --vault-name {key_vault_name} --name {secret_id} --query value -o tsv)
-
 GIT_USER=$(echo "$SECRET_JSON" | jq -r '.git_deploy_username // "x-token-auth"')
 GIT_TOKEN=$(echo "$SECRET_JSON" | jq -r '.git_deploy_token')
-NESSIE_DB_PASS=$(echo "$SECRET_JSON" | jq -r '.NESSIE_DB_PASS')
+NESSIE_DB_PASS=$(echo "$SECRET_JSON" | jq -r '.NESSIE_DB_PASS')""",
 
-# Clone repo
-REPO_URL="{git_repo_url}"
-REPO_PATH=$(echo "$REPO_URL" | sed 's,https://,,')
-git clone "https://$GIT_USER:$GIT_TOKEN@$REPO_PATH" /home/ubuntu/trino
-git -C /home/ubuntu/trino checkout {git_branch}
-git -C /home/ubuntu/trino rev-parse HEAD > /home/ubuntu/trino/.schema-version
+        clone_repo(git_repo_url, git_branch),
 
-# Write .env from Key Vault secrets
-echo "$SECRET_JSON" | jq -r 'to_entries[] | .key + "=" + (.value | tostring)' > /home/ubuntu/trino/.env
+        write_env_from_secret_json(),
 
-# Inject Pulumi-provisioned infrastructure values
-echo "NESSIE_DB_URL=jdbc:postgresql://{pg_fqdn}:5432/{nessie_db_name}" >> /home/ubuntu/trino/.env
+        # ── Azure-specific: inject Pulumi-provisioned values into .env ────────
+        f"""echo "NESSIE_DB_URL=jdbc:postgresql://{pg_fqdn}:5432/{nessie_db_name}" >> /home/ubuntu/trino/.env
 echo "NESSIE_DB_USER={nessie_db_user}" >> /home/ubuntu/trino/.env
 echo "AZURE_STORAGE_ACCOUNT={sa_name}" >> /home/ubuntu/trino/.env
 echo "AZURE_STORAGE_KEY={sa_key}" >> /home/ubuntu/trino/.env
-echo "ICEBERG_WAREHOUSE_DIR=abfs://warehouse@{sa_name}.dfs.core.windows.net/" >> /home/ubuntu/trino/.env
-chmod 600 /home/ubuntu/trino/.env
+echo "ICEBERG_WAREHOUSE_DIR=abfs://warehouse@{sa_name}.dfs.core.windows.net/" >> /home/ubuntu/trino/.env""",
 
-# Start Nessie on host network so it's reachable by Trino containers via docker0 gateway
-docker run -d \\
+        # ── Azure-specific: Nessie (runs on this VM, not a managed service) ───
+        f"""docker run -d \\
   --name nessie \\
   --restart unless-stopped \\
   --network host \\
@@ -400,21 +387,17 @@ docker run -d \\
   -e NESSIE_VERSION_STORE_TYPE=JDBC \\
   projectnessie/nessie
 
-# Wait for Nessie to be ready
 until curl -sf http://localhost:19120/api/v2/config > /dev/null 2>&1; do
   echo "Waiting for Nessie..."
   sleep 5
 done
 
-# Trino containers reach Nessie via the docker0 bridge gateway
 DOCKER_GW=$(ip -4 addr show docker0 2>/dev/null | grep 'inet ' | awk '{{print $2}}' | cut -d/ -f1 || echo "172.17.0.1")
-echo "CATALOG_URL=http://$DOCKER_GW:19120" >> /home/ubuntu/trino/.env
+echo "CATALOG_URL=http://$DOCKER_GW:19120" >> /home/ubuntu/trino/.env""",
 
-# Generate Trino config and start coordinator + worker on the same VM
-cd /home/ubuntu/trino
-python3 config_generator.py envs_prod.json --env-file .env
-docker-compose -f docker-compose.yml up -d --scale trino-worker={worker_count}
-"""
+        generate_config_and_start(worker_count),
+    ]
+    script = "\n\n".join(sections)
     return base64.b64encode(script.encode()).decode()
 
 coordinator_custom_data = pulumi.Output.all(
