@@ -408,7 +408,7 @@ done
 
 # Trino containers reach Nessie via the docker0 bridge gateway
 DOCKER_GW=$(ip -4 addr show docker0 2>/dev/null | grep 'inet ' | awk '{{print $2}}' | cut -d/ -f1 || echo "172.17.0.1")
-echo "CATALOG_URL=http://$DOCKER_GW:19120/api/v2" >> /home/ubuntu/trino/.env
+echo "CATALOG_URL=http://$DOCKER_GW:19120" >> /home/ubuntu/trino/.env
 
 # Generate Trino config and start coordinator + worker on the same VM
 cd /home/ubuntu/trino
