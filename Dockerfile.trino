@@ -1,20 +1,20 @@
 FROM registry.access.redhat.com/ubi9/ubi-minimal AS libs
 RUN microdnf install -y libstdc++ unzip && microdnf clean all \
-    && curl -L https://github.com/duckdb/duckdb/releases/download/v1.4.4/duckdb_cli-linux-amd64.zip \
+    && curl -L https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-amd64.zip \
        -o /tmp/duckdb.zip \
     && unzip /tmp/duckdb.zip -d /tmp \
     && chmod +x /tmp/duckdb \
     && rm /tmp/duckdb.zip \
-    && curl -L https://repo1.maven.org/maven2/org/duckdb/duckdb_jdbc/1.4.4.0/duckdb_jdbc-1.4.4.0.jar \
-       -o /tmp/duckdb_jdbc-1.4.4.0.jar
+    && curl -L https://repo1.maven.org/maven2/org/duckdb/duckdb_jdbc/1.5.5.0/duckdb_jdbc-1.5.5.0.jar \
+       -o /tmp/duckdb_jdbc-1.5.5.0.jar
 
 FROM trinodb/trino:471
 USER root
 COPY --from=libs /usr/lib64/libstdc++.so.6* /usr/lib64/
 COPY --from=libs /tmp/duckdb /usr/local/bin/duckdb
-COPY --from=libs /tmp/duckdb_jdbc-1.4.4.0.jar /tmp/
+COPY --from=libs /tmp/duckdb_jdbc-1.5.5.0.jar /tmp/
 RUN rm -f /usr/lib/trino/plugin/duckdb/duckdb_jdbc*.jar \
-    && mv /tmp/duckdb_jdbc-1.4.4.0.jar /usr/lib/trino/plugin/duckdb/
+    && mv /tmp/duckdb_jdbc-1.5.5.0.jar /usr/lib/trino/plugin/duckdb/
 RUN mkdir -p /data/duckdb && chown trino:trino /data/duckdb
 
 USER trino
