@@ -28,6 +28,9 @@ services:
       start_period: 60s
 
   trino-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.trino
     image: trino-dwe:471
     restart: unless-stopped
     depends_on:
