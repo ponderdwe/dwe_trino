@@ -1,6 +1,6 @@
 FROM registry.access.redhat.com/ubi9/ubi-minimal AS libs
 RUN microdnf install -y libstdc++ unzip && microdnf clean all \
-    && curl -L https://github.com/duckdb/duckdb/releases/download/v1.4.0/duckdb_cli-linux-amd64.zip \
+    && curl -L https://github.com/duckdb/duckdb/releases/download/v1.4.4/duckdb_cli-linux-amd64.zip \
        -o /tmp/duckdb.zip \
     && unzip /tmp/duckdb.zip -d /tmp \
     && chmod +x /tmp/duckdb \
