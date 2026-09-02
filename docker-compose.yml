@@ -13,8 +13,10 @@ services:
     volumes:
       - ./trino/coordinator-config.properties:/etc/trino/config.properties
       - ./trino/trino_connections/iceberg.properties:/etc/trino/catalog/iceberg.properties
+      - ./trino/trino_connections/duckdb.properties:/etc/trino/catalog/duckdb.properties
       - ./trino/password-authenticator.properties:/etc/trino/password-authenticator.properties
       - ./trino/password.db:/etc/trino/password.db
+      - duckdb_data:/data/duckdb
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8080/v1/info | grep -q '\"starting\":false' || exit 1"]
       interval: 15s
@@ -31,5 +33,10 @@ services:
     volumes:
       - ./trino/worker-config.properties:/etc/trino/config.properties
       - ./trino/trino_connections/iceberg.properties:/etc/trino/catalog/iceberg.properties
+      - ./trino/trino_connections/duckdb.properties:/etc/trino/catalog/duckdb.properties
       - ./trino/password-authenticator.properties:/etc/trino/password-authenticator.properties
       - ./trino/password.db:/etc/trino/password.db
+      - duckdb_data:/data/duckdb
+
+volumes:
+  duckdb_data:

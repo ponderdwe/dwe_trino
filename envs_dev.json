@@ -47,6 +47,14 @@
       }
     },
     {
+      "type": "properties",
+      "path": "trino/trino_connections/duckdb.properties",
+      "properties": {
+        "connector.name": "duckdb",
+        "connection-url": "jdbc:duckdb:/data/duckdb/local.db"
+      }
+    },
+    {
       "type": "db",
       "path": "trino/password.db",
       "username_var": "TRINO_USER",
