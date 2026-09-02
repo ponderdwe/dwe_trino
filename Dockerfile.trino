@@ -15,7 +15,9 @@ COPY --from=libs /tmp/duckdb /usr/local/bin/duckdb
 COPY --from=libs /tmp/duckdb_jdbc-1.5.5.0.jar /tmp/
 RUN rm -f /usr/lib/trino/plugin/duckdb/duckdb_jdbc*.jar \
     && mv /tmp/duckdb_jdbc-1.5.5.0.jar /usr/lib/trino/plugin/duckdb/
-RUN mkdir -p /data/duckdb && chown trino:trino /data/duckdb
+RUN mkdir -p /data/duckdb /opt/duckdb && chown trino:trino /data/duckdb /opt/duckdb
 
 USER trino
-RUN duckdb -c "INSTALL httpfs;"
+# Install httpfs and pre-create the persistent database with httpfs loaded
+RUN duckdb -c "INSTALL httpfs;" \
+    && duckdb /opt/duckdb/trino.duckdb -c "LOAD httpfs; SET GLOBAL force_download = true; SELECT 1;"
