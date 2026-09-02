@@ -18,6 +18,8 @@ RUN rm -f /usr/lib/trino/plugin/duckdb/duckdb_jdbc*.jar \
 RUN mkdir -p /data/duckdb /opt/duckdb && chown trino:trino /data/duckdb /opt/duckdb
 
 USER trino
-# Install httpfs and pre-create the persistent database with httpfs loaded
+# CLI config: set force_download for interactive duckdb sessions
+RUN echo "SET GLOBAL force_download = true;" > /home/trino/.duckdbrc
+# Install httpfs and pre-create the persistent database with httpfs and force_download persisted
 RUN duckdb -c "INSTALL httpfs;" \
     && duckdb /opt/duckdb/trino.duckdb -c "LOAD httpfs; SET GLOBAL force_download = true; SELECT 1;"
