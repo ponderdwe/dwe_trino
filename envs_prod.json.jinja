@@ -38,6 +38,8 @@
         "iceberg.nessie-catalog.uri": "${CATALOG_URL}/api/v1",
         "iceberg.nessie-catalog.default-warehouse-dir": "${ICEBERG_WAREHOUSE_DIR}",
         "iceberg.nessie-catalog.ref": "main",
+        "iceberg.nessie-catalog.authentication.type": "${NESSIE_AUTH_TYPE}",
+        "iceberg.nessie-catalog.authentication.token": "${NESSIE_TOKEN}",
 {% if cloud_provider == "azure" %}
         "fs.native-azure.enabled": "true",
         "azure.auth-type": "ACCESS_KEY",

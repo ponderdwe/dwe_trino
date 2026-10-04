@@ -1,10 +1,9 @@
 """
 DWE Trino Infrastructure — Azure Pulumi IaC
-Provisions: PostgreSQL + Storage Account (Nessie) +
+Provisions: Storage Account (Iceberg warehouse) +
             App Gateway + Coordinator VMSS + Worker VMSS + DNS
 
-Coordinator VM: runs Nessie catalog + Trino coordinator
-Worker VMs:     run Trino workers (N instances, discover coordinator IP via az vmss nic list)
+Trino connects to an external Nessie catalog via CATALOG_URL (dwe_nessie adapter).
 
 Run with: pulumi stack select prod && pulumi up --yes
 """
@@ -21,7 +20,6 @@ from _startup import (
     write_env_from_secret_json,
 )
 import pulumi_azure_native as azure_native
-import pulumi_azure_native.dbforpostgresql.v20221201 as pg
 import yaml
 from azure.identity import DefaultAzureCredential
 from azure.keyvault.secrets import SecretClient
@@ -52,8 +50,7 @@ subscription_id   = config.require("subscription_id")
 app_port          = 8080
 startup_code_version = config.get("startup_code_version") or ""
 
-suffix       = f"-{env}" if env != "prod" else ""
-nessie_db_name = f"nessie_{env}"
+suffix = f"-{env}" if env != "prod" else ""
 tags = {
     "Project":     project_name,
     "ManagedBy":   "Pulumi",
@@ -89,15 +86,9 @@ git_deploy_token    = secrets["git_deploy_token"]
 git_deploy_username = secrets.get("git_deploy_username", "x-token-auth")
 
 # ── Trino runtime — validate required secrets ─────────────────────────────────
-for _key in ("TRINO_USER", "TRINO_PASSWORD", "TRINO_SHARED_SECRET"):
+for _key in ("CATALOG_URL", "TRINO_USER", "TRINO_PASSWORD", "TRINO_SHARED_SECRET"):
     if not secrets.get(_key):
         raise ValueError(f"Required secret '{_key}' missing from Key Vault secret {secret_id}")
-
-# ── Nessie DB credentials ─────────────────────────────────────────────────────
-for _key in ("NESSIE_DB_HOST", "NESSIE_DB_PASS"):
-    if not secrets.get(_key):
-        raise ValueError(f"Required secret '{_key}' missing from Key Vault secret {secret_id}")
-nessie_db_pass = secrets["NESSIE_DB_PASS"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # User-assigned Managed Identity (used by VMSS to read Key Vault)
@@ -126,20 +117,7 @@ kv_access = azure_native.authorization.RoleAssignment(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PostgreSQL database for Nessie — created in the existing cluster
-# ─────────────────────────────────────────────────────────────────────────────
-nessie_db_host = secrets["NESSIE_DB_HOST"]
-nessie_db_user = secrets.get("NESSIE_DB_USER", "nessie")
-pg_fqdn_output = pulumi.Output.from_input(nessie_db_host)
-pg.Database(
-    f"{project_name}-pg-db{suffix}",
-    resource_group_name=resource_group,
-    server_name=nessie_db_host.split(".")[0],
-    database_name=nessie_db_name,
-)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Azure Storage Account + Blob Container (Nessie Iceberg warehouse, ADLS Gen2)
+# Azure Storage Account + Blob Container (Iceberg warehouse, ADLS Gen2)
 # ─────────────────────────────────────────────────────────────────────────────
 sa_env_suffix        = env if env != "prod" else ""
 storage_account_name = (project_name.replace("-", "") + "nessie" + sa_env_suffix)[:24]
@@ -196,14 +174,8 @@ vm_nsg = azure_native.network.NetworkSecurityGroup(
             source_address_prefix="VirtualNetwork", destination_address_prefix="*",
         ),
         azure_native.network.SecurityRuleArgs(
-            name="AllowNessie",
-            priority=110, direction="Inbound", access="Allow", protocol="Tcp",
-            source_port_range="*", destination_port_range="19120",
-            source_address_prefix="VirtualNetwork", destination_address_prefix="*",
-        ),
-        azure_native.network.SecurityRuleArgs(
             name="AllowSSH",
-            priority=120, direction="Inbound", access="Allow", protocol="Tcp",
+            priority=110, direction="Inbound", access="Allow", protocol="Tcp",
             source_port_range="*", destination_port_range="22",
             source_address_prefix="VirtualNetwork", destination_address_prefix="*",
         ),
@@ -346,9 +318,9 @@ app_gw = azure_native.network.ApplicationGateway(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Coordinator startup script — Nessie (host network) + Trino coordinator
+# Coordinator startup script — Trino coordinator (external Nessie via CATALOG_URL)
 # ─────────────────────────────────────────────────────────────────────────────
-def _build_coordinator_script(pg_fqdn: str, sa_name: str, sa_key: str) -> str:
+def _build_coordinator_script(sa_name: str, sa_key: str) -> str:
     sections = [
         f"#!/bin/bash\nset -e\nexec > >(tee /var/log/trino-init.log | logger -t trino-init) 2>&1\n\n# startup_code_version={startup_code_version}\necho 'Starting coordinator init'",
 
@@ -362,38 +334,16 @@ curl -sL https://aka.ms/InstallAzureCLIDeb | bash
 az login --identity
 SECRET_JSON=$(az keyvault secret show --vault-name {key_vault_name} --name {secret_id} --query value -o tsv)
 GIT_USER=$(echo "$SECRET_JSON" | jq -r '.git_deploy_username // "x-token-auth"')
-GIT_TOKEN=$(echo "$SECRET_JSON" | jq -r '.git_deploy_token')
-NESSIE_DB_PASS=$(echo "$SECRET_JSON" | jq -r '.NESSIE_DB_PASS')""",
+GIT_TOKEN=$(echo "$SECRET_JSON" | jq -r '.git_deploy_token')""",
 
         clone_repo(git_repo_url, git_branch),
 
         write_env_from_secret_json(),
 
-        # ── Azure-specific: inject Pulumi-provisioned values into .env ────────
-        f"""echo "NESSIE_DB_URL=jdbc:postgresql://{pg_fqdn}:5432/{nessie_db_name}" >> /home/ubuntu/trino/.env
-echo "NESSIE_DB_USER={nessie_db_user}" >> /home/ubuntu/trino/.env
-echo "AZURE_STORAGE_ACCOUNT={sa_name}" >> /home/ubuntu/trino/.env
+        # ── Azure-specific: inject Pulumi-provisioned storage values into .env ─
+        f"""echo "AZURE_STORAGE_ACCOUNT={sa_name}" >> /home/ubuntu/trino/.env
 echo "AZURE_STORAGE_KEY={sa_key}" >> /home/ubuntu/trino/.env
 echo "ICEBERG_WAREHOUSE_DIR=abfs://warehouse@{sa_name}.dfs.core.windows.net/" >> /home/ubuntu/trino/.env""",
-
-        # ── Azure-specific: Nessie (runs on this VM, not a managed service) ───
-        f"""docker run -d \\
-  --name nessie \\
-  --restart unless-stopped \\
-  --network host \\
-  -e QUARKUS_DATASOURCE_JDBC_URL="jdbc:postgresql://{pg_fqdn}:5432/{nessie_db_name}" \\
-  -e QUARKUS_DATASOURCE_USERNAME="{nessie_db_user}" \\
-  -e QUARKUS_DATASOURCE_PASSWORD="$NESSIE_DB_PASS" \\
-  -e NESSIE_VERSION_STORE_TYPE=JDBC \\
-  projectnessie/nessie
-
-until curl -sf http://localhost:19120/api/v2/config > /dev/null 2>&1; do
-  echo "Waiting for Nessie..."
-  sleep 5
-done
-
-DOCKER_GW=$(ip -4 addr show docker0 2>/dev/null | grep 'inet ' | awk '{{print $2}}' | cut -d/ -f1 || echo "172.17.0.1")
-echo "CATALOG_URL=http://$DOCKER_GW:19120" >> /home/ubuntu/trino/.env""",
 
         generate_config_and_start(worker_count),
     ]
@@ -401,7 +351,6 @@ echo "CATALOG_URL=http://$DOCKER_GW:19120" >> /home/ubuntu/trino/.env""",
     return base64.b64encode(script.encode()).decode()
 
 coordinator_custom_data = pulumi.Output.all(
-    pg_fqdn_output,
     storage_account.name,
     storage_key,
 ).apply(lambda args: _build_coordinator_script(*args))
@@ -569,4 +518,3 @@ pulumi.export("public_ip",              public_ip.ip_address)
 pulumi.export("environment",             env)
 if worker_vmss:
     pulumi.export("worker_vmss_name",    worker_vmss.name)
-pulumi.export("pg_server_fqdn",          pg_fqdn_output)

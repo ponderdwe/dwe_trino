@@ -38,6 +38,8 @@
         "iceberg.nessie-catalog.uri": "${CATALOG_URL}/api/v1",
         "iceberg.nessie-catalog.default-warehouse-dir": "s3://warehouse",
         "iceberg.nessie-catalog.ref": "main",
+        "iceberg.nessie-catalog.authentication.type": "${NESSIE_AUTH_TYPE}",
+        "iceberg.nessie-catalog.authentication.token": "${NESSIE_TOKEN}",
         "fs.native-s3.enabled": "true",
         "s3.endpoint": "${S3_ENDPOINT}",
         "s3.region": "us-east-1",

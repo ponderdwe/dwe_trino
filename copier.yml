@@ -1,7 +1,7 @@
 _dwe_hub:
   hub_name: trino
   display_name: "Trino Query Engine"
-  description: "Trino coordinator (with co-located Nessie Iceberg catalog) + worker nodes, self-contained deployment"
+  description: "Trino coordinator + worker nodes — connects to an external Nessie Iceberg catalog (dwe_nessie adapter)"
   icon: "database"
   git_providers:
     - github
@@ -24,7 +24,7 @@ _dwe_hub:
         trigger_secret: DNS_ZONE_NAME
         properties:
           hostname: DNS_RECORD_NAME
-  depends_on: []
+  depends_on: [dwe_nessie]
   kg_pulumi_outputs:
     url: url
     appgw_name: appgw_name
@@ -109,11 +109,8 @@ _dwe_hub:
     - key: git_deploy_username
       description: "Git username for HTTPS clone (e.g. x-token-auth)"
       destination: secrets_manager
-    - key: NESSIE_DB_HOST
-      description: "PostgreSQL hostname for Nessie (e.g. myserver.postgres.database.azure.com)"
-      destination: secrets_manager
-    - key: NESSIE_DB_PASS
-      description: "Nessie database password"
+    - key: CATALOG_URL
+      description: "Nessie catalog base URL (e.g. http://nessie.internal:19120 or https://nessie.example.com)"
       destination: secrets_manager
     - key: TRINO_USER
       description: "Trino admin username"
@@ -137,8 +134,8 @@ _dwe_hub:
       destination: secrets_manager
       cloud_provider: aws
   optional_secrets:
-    - key: NESSIE_DB_USER
-      description: "PostgreSQL username for Nessie (defaults to 'nessie')"
+    - key: NESSIE_TOKEN
+      description: "Bearer token for Nessie API (leave empty if Nessie has no auth)"
       destination: secrets_manager
     - key: DNS_ZONE_RESOURCE_GROUP
       description: "Resource group for DNS zone (defaults to RESOURCE_GROUP)"

@@ -28,5 +28,12 @@ chmod 600 /home/ubuntu/trino/.env"""
 
 def generate_config_and_start(worker_count: int) -> str:
     return f"""cd /home/ubuntu/trino
+# Set Nessie auth type based on whether NESSIE_TOKEN is present and non-empty
+if grep -q '^NESSIE_TOKEN=.' .env 2>/dev/null; then
+  echo "NESSIE_AUTH_TYPE=BEARER" >> .env
+else
+  echo "NESSIE_AUTH_TYPE=NONE" >> .env
+  grep -q '^NESSIE_TOKEN=' .env || echo "NESSIE_TOKEN=" >> .env
+fi
 python3 config_generator.py envs_prod.json --env-file .env
 docker-compose -f docker-compose.yml up -d --scale trino-worker={worker_count}"""
