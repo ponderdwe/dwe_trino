@@ -71,12 +71,12 @@ secrets = get_secret(key_vault_name, secret_id)
 
 # ── Infrastructure ────────────────────────────────────────────────────────────
 vnet_id          = secrets["VNET_ID"]
-existing_appgw_backend_pool_id = secrets.get("EXISTING_APP_GW_BACKEND_POOL_ID", "")
-existing_appgw_public_ip       = secrets.get("EXISTING_APP_GW_PUBLIC_IP", "")
-use_existing_lb = bool(existing_appgw_backend_pool_id)
-if use_existing_lb:
-    if not existing_appgw_public_ip:
-        raise ValueError("EXISTING_APP_GW_PUBLIC_IP is required when EXISTING_APP_GW_BACKEND_POOL_ID is set")
+common_app_gw_id        = secrets.get("COMMON_APP_GW_ID", "")
+common_app_gw_public_ip = secrets.get("COMMON_APP_GW_PUBLIC_IP", "")
+use_common_lb = bool(common_app_gw_id)
+if use_common_lb:
+    if not common_app_gw_public_ip:
+        raise ValueError("COMMON_APP_GW_PUBLIC_IP is required when COMMON_APP_GW_ID is set")
 else:
     app_gw_subnet_id = secrets["APP_GW_SUBNET_ID"]
 vm_subnet_id     = secrets["VM_SUBNET_ID"]
@@ -156,7 +156,7 @@ storage_key = azure_native.storage.list_storage_account_keys_output(
 # Public IP for Application Gateway (skipped when using existing load balancer)
 # ─────────────────────────────────────────────────────────────────────────────
 public_ip = None
-if not use_existing_lb:
+if not use_common_lb:
     public_ip = azure_native.network.PublicIPAddress(
         f"{project_name}-pip{suffix}",
         resource_group_name=resource_group,
@@ -281,7 +281,7 @@ ag_identity = identity.id.apply(lambda iid: azure_native.network.ManagedServiceI
 )) if has_ssl else None
 
 app_gw = None
-if not use_existing_lb:
+if not use_common_lb:
     app_gw = azure_native.network.ApplicationGateway(
         app_gw_name,
         resource_group_name=resource_group,
@@ -421,7 +421,7 @@ coordinator_vmss = azure_native.compute.VirtualMachineScaleSet(
                             subnet=azure_native.compute.ApiEntityReferenceArgs(id=vm_subnet_id),
                             application_gateway_backend_address_pools=[
                                 azure_native.network.SubResourceArgs(
-                                    id=(existing_appgw_backend_pool_id if use_existing_lb
+                                    id=(f"{common_app_gw_id}/backendAddressPools/trino-pool" if use_common_lb
                                         else f"{ag_prefix}/backendAddressPools/backendPool")
                                 )
                             ],
@@ -434,7 +434,7 @@ coordinator_vmss = azure_native.compute.VirtualMachineScaleSet(
     ),
     tags=tags,
     opts=pulumi.ResourceOptions(
-        depends_on=([kv_access, storage_account] if use_existing_lb else [app_gw, kv_access, storage_account]),
+        depends_on=([kv_access, storage_account] if use_common_lb else [app_gw, kv_access, storage_account]),
         replace_on_changes=["virtualMachineProfile"],
         delete_before_replace=True,
     ),
@@ -453,8 +453,8 @@ azure_native.network.RecordSet(
     record_type="A",
     ttl=30,
     a_records=(
-        [azure_native.network.ARecordArgs(ipv4_address=existing_appgw_public_ip)]
-        if use_existing_lb
+        [azure_native.network.ARecordArgs(ipv4_address=common_app_gw_public_ip)]
+        if use_common_lb
         else public_ip.ip_address.apply(
             lambda ip: [azure_native.network.ARecordArgs(ipv4_address=ip)] if ip else []
         )
