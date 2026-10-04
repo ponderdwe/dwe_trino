@@ -146,6 +146,22 @@ _dwe_hub:
     - key: KG_API_TOKEN
       description: "Bearer token for Deploy Management API"
       destination: secrets_manager
+    - key: EXISTING_APP_GW_BACKEND_POOL_ID
+      description: "Full resource ID of an existing App Gateway backend pool to attach this VMSS to instead of creating a new gateway (e.g. /subscriptions/.../backendAddressPools/backendPool)"
+      destination: secrets_manager
+      cloud_provider: azure
+    - key: EXISTING_APP_GW_PUBLIC_IP
+      description: "Public IPv4 of the existing App Gateway frontend (required with EXISTING_APP_GW_BACKEND_POOL_ID)"
+      destination: secrets_manager
+      cloud_provider: azure
+    - key: EXISTING_TARGET_GROUP_ARN
+      description: "ARN of an existing ALB target group to use instead of creating a new load balancer"
+      destination: secrets_manager
+      cloud_provider: aws
+    - key: EXISTING_ALB_DNS_NAME
+      description: "DNS name of the existing ALB (required with EXISTING_TARGET_GROUP_ARN)"
+      destination: secrets_manager
+      cloud_provider: aws
 
 _templates_suffix: .jinja
 

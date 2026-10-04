@@ -71,7 +71,14 @@ secrets = get_secret(key_vault_name, secret_id)
 
 # ── Infrastructure ────────────────────────────────────────────────────────────
 vnet_id          = secrets["VNET_ID"]
-app_gw_subnet_id = secrets["APP_GW_SUBNET_ID"]
+existing_appgw_backend_pool_id = secrets.get("EXISTING_APP_GW_BACKEND_POOL_ID", "")
+existing_appgw_public_ip       = secrets.get("EXISTING_APP_GW_PUBLIC_IP", "")
+use_existing_lb = bool(existing_appgw_backend_pool_id)
+if use_existing_lb:
+    if not existing_appgw_public_ip:
+        raise ValueError("EXISTING_APP_GW_PUBLIC_IP is required when EXISTING_APP_GW_BACKEND_POOL_ID is set")
+else:
+    app_gw_subnet_id = secrets["APP_GW_SUBNET_ID"]
 vm_subnet_id     = secrets["VM_SUBNET_ID"]
 ssh_public_key   = secrets["SSH_PUBLIC_KEY"]
 
@@ -146,17 +153,19 @@ storage_key = azure_native.storage.list_storage_account_keys_output(
 ).apply(lambda r: r.keys[0].value)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Public IP for Application Gateway
+# Public IP for Application Gateway (skipped when using existing load balancer)
 # ─────────────────────────────────────────────────────────────────────────────
-public_ip = azure_native.network.PublicIPAddress(
-    f"{project_name}-pip{suffix}",
-    resource_group_name=resource_group,
-    location=azure_location,
-    public_ip_address_name=f"{project_name}-pip{suffix}",
-    sku=azure_native.network.PublicIPAddressSkuArgs(name="Standard"),
-    public_ip_allocation_method="Static",
-    tags=tags,
-)
+public_ip = None
+if not use_existing_lb:
+    public_ip = azure_native.network.PublicIPAddress(
+        f"{project_name}-pip{suffix}",
+        resource_group_name=resource_group,
+        location=azure_location,
+        public_ip_address_name=f"{project_name}-pip{suffix}",
+        sku=azure_native.network.PublicIPAddressSkuArgs(name="Standard"),
+        public_ip_allocation_method="Static",
+        tags=tags,
+    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Network Security Groups
@@ -271,51 +280,53 @@ ag_identity = identity.id.apply(lambda iid: azure_native.network.ManagedServiceI
     user_assigned_identities={iid: {}},
 )) if has_ssl else None
 
-app_gw = azure_native.network.ApplicationGateway(
-    app_gw_name,
-    resource_group_name=resource_group,
-    application_gateway_name=app_gw_name,
-    location=azure_location,
-    sku=azure_native.network.ApplicationGatewaySkuArgs(
-        name="Standard_v2", tier="Standard_v2", capacity=1),
-    identity=ag_identity,
-    gateway_ip_configurations=[azure_native.network.ApplicationGatewayIPConfigurationArgs(
-        name="appGatewayIpConfig",
-        subnet=azure_native.network.SubResourceArgs(id=app_gw_subnet_id),
-    )],
-    frontend_ip_configurations=[azure_native.network.ApplicationGatewayFrontendIPConfigurationArgs(
-        name="appGwPublicFrontendIp",
-        public_ip_address=azure_native.network.SubResourceArgs(id=public_ip.id),
-    )],
-    frontend_ports=[
-        azure_native.network.ApplicationGatewayFrontendPortArgs(name="port_80", port=80),
-        azure_native.network.ApplicationGatewayFrontendPortArgs(name="port_443", port=443),
-    ],
-    backend_address_pools=[
-        azure_native.network.ApplicationGatewayBackendAddressPoolArgs(name="backendPool"),
-    ],
-    backend_http_settings_collection=[
-        azure_native.network.ApplicationGatewayBackendHttpSettingsArgs(
-            name="backendHttpSettings",
-            port=app_port, protocol="Http",
-            cookie_based_affinity="Disabled",
-            request_timeout=600,
-            probe=azure_native.network.SubResourceArgs(id=f"{ag_prefix}/probes/healthProbe"),
-        )
-    ],
-    probes=[azure_native.network.ApplicationGatewayProbeArgs(
-        name="healthProbe",
-        protocol="Http", host="127.0.0.1",
-        path="/v1/info",
-        interval=30, timeout=10, unhealthy_threshold=3,
-    )],
-    http_listeners=http_listeners,
-    request_routing_rules=routing_rules,
-    ssl_certificates=ssl_certs,
-    redirect_configurations=redirect_configurations,
-    tags=tags,
-    opts=pulumi.ResourceOptions(depends_on=[public_ip, kv_access, vm_nsg]),
-)
+app_gw = None
+if not use_existing_lb:
+    app_gw = azure_native.network.ApplicationGateway(
+        app_gw_name,
+        resource_group_name=resource_group,
+        application_gateway_name=app_gw_name,
+        location=azure_location,
+        sku=azure_native.network.ApplicationGatewaySkuArgs(
+            name="Standard_v2", tier="Standard_v2", capacity=1),
+        identity=ag_identity,
+        gateway_ip_configurations=[azure_native.network.ApplicationGatewayIPConfigurationArgs(
+            name="appGatewayIpConfig",
+            subnet=azure_native.network.SubResourceArgs(id=app_gw_subnet_id),
+        )],
+        frontend_ip_configurations=[azure_native.network.ApplicationGatewayFrontendIPConfigurationArgs(
+            name="appGwPublicFrontendIp",
+            public_ip_address=azure_native.network.SubResourceArgs(id=public_ip.id),
+        )],
+        frontend_ports=[
+            azure_native.network.ApplicationGatewayFrontendPortArgs(name="port_80", port=80),
+            azure_native.network.ApplicationGatewayFrontendPortArgs(name="port_443", port=443),
+        ],
+        backend_address_pools=[
+            azure_native.network.ApplicationGatewayBackendAddressPoolArgs(name="backendPool"),
+        ],
+        backend_http_settings_collection=[
+            azure_native.network.ApplicationGatewayBackendHttpSettingsArgs(
+                name="backendHttpSettings",
+                port=app_port, protocol="Http",
+                cookie_based_affinity="Disabled",
+                request_timeout=600,
+                probe=azure_native.network.SubResourceArgs(id=f"{ag_prefix}/probes/healthProbe"),
+            )
+        ],
+        probes=[azure_native.network.ApplicationGatewayProbeArgs(
+            name="healthProbe",
+            protocol="Http", host="127.0.0.1",
+            path="/v1/info",
+            interval=30, timeout=10, unhealthy_threshold=3,
+        )],
+        http_listeners=http_listeners,
+        request_routing_rules=routing_rules,
+        ssl_certificates=ssl_certs,
+        redirect_configurations=redirect_configurations,
+        tags=tags,
+        opts=pulumi.ResourceOptions(depends_on=[public_ip, kv_access, vm_nsg]),
+    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Coordinator startup script — Trino coordinator (external Nessie via CATALOG_URL)
@@ -410,7 +421,8 @@ coordinator_vmss = azure_native.compute.VirtualMachineScaleSet(
                             subnet=azure_native.compute.ApiEntityReferenceArgs(id=vm_subnet_id),
                             application_gateway_backend_address_pools=[
                                 azure_native.network.SubResourceArgs(
-                                    id=f"{ag_prefix}/backendAddressPools/backendPool"
+                                    id=(existing_appgw_backend_pool_id if use_existing_lb
+                                        else f"{ag_prefix}/backendAddressPools/backendPool")
                                 )
                             ],
                         )
@@ -422,7 +434,7 @@ coordinator_vmss = azure_native.compute.VirtualMachineScaleSet(
     ),
     tags=tags,
     opts=pulumi.ResourceOptions(
-        depends_on=[app_gw, kv_access, storage_account],
+        depends_on=([kv_access, storage_account] if use_existing_lb else [app_gw, kv_access, storage_account]),
         replace_on_changes=["virtualMachineProfile"],
         delete_before_replace=True,
     ),
@@ -440,8 +452,12 @@ azure_native.network.RecordSet(
     relative_record_set_name=dns_record_name,
     record_type="A",
     ttl=30,
-    a_records=public_ip.ip_address.apply(
-        lambda ip: [azure_native.network.ARecordArgs(ipv4_address=ip)] if ip else []
+    a_records=(
+        [azure_native.network.ARecordArgs(ipv4_address=existing_appgw_public_ip)]
+        if use_existing_lb
+        else public_ip.ip_address.apply(
+            lambda ip: [azure_native.network.ARecordArgs(ipv4_address=ip)] if ip else []
+        )
     ),
 )
 
@@ -463,7 +479,7 @@ if _kg_host and _kg_token and _kg_mappings:
 
     _pulumi_export_map = {
         "url":                  pulumi.Output.from_input(f"https://{dns_record_name}.{dns_zone_name}"),
-        "appgw_name":           app_gw.name,
+        "appgw_name":           app_gw.name if app_gw else pulumi.Output.from_input(""),
         "coordinator_vmss_name": coordinator_vmss.name,
         "worker_vmss_name":     worker_vmss.name if worker_vmss else pulumi.Output.from_input(""),
     }
@@ -510,11 +526,13 @@ if _kg_host and _kg_token and _kg_mappings:
 # ─────────────────────────────────────────────────────────────────────────────
 # Outputs
 # ─────────────────────────────────────────────────────────────────────────────
-pulumi.export("appgw_name",              app_gw.name)
+if app_gw:
+    pulumi.export("appgw_name",              app_gw.name)
 pulumi.export("coordinator_vmss_name",   coordinator_vmss.name)
 pulumi.export("storage_account_name",    storage_account.name)
 pulumi.export("url",                     f"https://{dns_record_name}.{dns_zone_name}")
-pulumi.export("public_ip",              public_ip.ip_address)
+if public_ip:
+    pulumi.export("public_ip",               public_ip.ip_address)
 pulumi.export("environment",             env)
 if worker_vmss:
     pulumi.export("worker_vmss_name",    worker_vmss.name)

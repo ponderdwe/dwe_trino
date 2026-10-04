@@ -71,9 +71,17 @@ lb_security_group_id  = secrets.get("LB_SECURITY_GROUP_ID", "")
 alb_internal          = secrets.get("ALB_INTERNAL", "false").lower() == "true"
 
 # ── Networking / DNS ──────────────────────────────────────────────────────────
-route53_zone_id     = secrets["ROUTE53_ZONE_ID"]
-dns_name            = secrets["DNS_NAME"]
-acm_certificate_arn = secrets["ACM_CERTIFICATE_ARN"]
+route53_zone_id           = secrets["ROUTE53_ZONE_ID"]
+dns_name                  = secrets["DNS_NAME"]
+existing_target_group_arn = secrets.get("EXISTING_TARGET_GROUP_ARN", "")
+existing_alb_dns_name     = secrets.get("EXISTING_ALB_DNS_NAME", "")
+use_existing_lb = bool(existing_target_group_arn)
+if use_existing_lb:
+    if not existing_alb_dns_name:
+        raise ValueError("EXISTING_ALB_DNS_NAME is required when EXISTING_TARGET_GROUP_ARN is set")
+    acm_certificate_arn = ""
+else:
+    acm_certificate_arn = secrets["ACM_CERTIFICATE_ARN"]
 
 # ── Git ───────────────────────────────────────────────────────────────────────
 git_deploy_token    = secrets["git_deploy_token"]
@@ -113,22 +121,24 @@ instance_profile = aws.iam.InstanceProfile(
 vpc_info = aws.ec2.get_vpc(id=vpc_id)
 access_cidr = [vpc_info.cidr_block] if alb_internal else ["0.0.0.0/0"]
 
-alb_sg = aws.ec2.SecurityGroup(
-    f"{project_name}-alb-sg{suffix}",
-    name=f"{project_name}-alb-sg{suffix}",
-    description="Trino ALB",
-    vpc_id=vpc_id,
-    tags={**tags, "Name": f"{project_name}-alb-sg{suffix}"},
-)
-aws.ec2.SecurityGroupRule(f"{project_name}-alb-http{suffix}",
-    type="ingress", security_group_id=alb_sg.id,
-    protocol="tcp", from_port=80, to_port=80, cidr_blocks=access_cidr)
-aws.ec2.SecurityGroupRule(f"{project_name}-alb-https{suffix}",
-    type="ingress", security_group_id=alb_sg.id,
-    protocol="tcp", from_port=443, to_port=443, cidr_blocks=access_cidr)
-aws.ec2.SecurityGroupRule(f"{project_name}-alb-egress{suffix}",
-    type="egress", security_group_id=alb_sg.id,
-    protocol="-1", from_port=0, to_port=0, cidr_blocks=["0.0.0.0/0"])
+alb_sg = None
+if not use_existing_lb:
+    alb_sg = aws.ec2.SecurityGroup(
+        f"{project_name}-alb-sg{suffix}",
+        name=f"{project_name}-alb-sg{suffix}",
+        description="Trino ALB",
+        vpc_id=vpc_id,
+        tags={**tags, "Name": f"{project_name}-alb-sg{suffix}"},
+    )
+    aws.ec2.SecurityGroupRule(f"{project_name}-alb-http{suffix}",
+        type="ingress", security_group_id=alb_sg.id,
+        protocol="tcp", from_port=80, to_port=80, cidr_blocks=access_cidr)
+    aws.ec2.SecurityGroupRule(f"{project_name}-alb-https{suffix}",
+        type="ingress", security_group_id=alb_sg.id,
+        protocol="tcp", from_port=443, to_port=443, cidr_blocks=access_cidr)
+    aws.ec2.SecurityGroupRule(f"{project_name}-alb-egress{suffix}",
+        type="egress", security_group_id=alb_sg.id,
+        protocol="-1", from_port=0, to_port=0, cidr_blocks=["0.0.0.0/0"])
 
 ec2_sg = aws.ec2.SecurityGroup(
     f"{project_name}-ec2-sg{suffix}",
@@ -137,10 +147,16 @@ ec2_sg = aws.ec2.SecurityGroup(
     vpc_id=vpc_id,
     tags={**tags, "Name": f"{project_name}-ec2-sg{suffix}"},
 )
-aws.ec2.SecurityGroupRule(f"{project_name}-ec2-app{suffix}",
-    type="ingress", security_group_id=ec2_sg.id,
-    protocol="tcp", from_port=app_port, to_port=app_port,
-    source_security_group_id=alb_sg.id)
+if use_existing_lb:
+    aws.ec2.SecurityGroupRule(f"{project_name}-ec2-app{suffix}",
+        type="ingress", security_group_id=ec2_sg.id,
+        protocol="tcp", from_port=app_port, to_port=app_port,
+        cidr_blocks=[vpc_info.cidr_block])
+else:
+    aws.ec2.SecurityGroupRule(f"{project_name}-ec2-app{suffix}",
+        type="ingress", security_group_id=ec2_sg.id,
+        protocol="tcp", from_port=app_port, to_port=app_port,
+        source_security_group_id=alb_sg.id)
 aws.ec2.SecurityGroupRule(f"{project_name}-ec2-ssh{suffix}",
     type="ingress", security_group_id=ec2_sg.id,
     protocol="tcp", from_port=22, to_port=22, cidr_blocks=access_cidr)
@@ -217,61 +233,64 @@ lt = aws.ec2.LaunchTemplate(
 # ─────────────────────────────────────────────────────────────────────────────
 # ALB
 # ─────────────────────────────────────────────────────────────────────────────
-alb_sg_ids = [alb_sg.id] + ([lb_security_group_id] if lb_security_group_id else [])
-alb = aws.lb.LoadBalancer(
-    f"{project_name}-alb{suffix}",
-    name=f"{project_name}-alb{suffix}",
-    internal=alb_internal,
-    load_balancer_type="application",
-    security_groups=alb_sg_ids,
-    subnets=alb_subnet_ids,
-    idle_timeout=600,
-    tags={**tags, "Name": f"{project_name}-alb{suffix}"},
-)
+alb = None
+tg = None
+if not use_existing_lb:
+    alb_sg_ids = [alb_sg.id] + ([lb_security_group_id] if lb_security_group_id else [])
+    alb = aws.lb.LoadBalancer(
+        f"{project_name}-alb{suffix}",
+        name=f"{project_name}-alb{suffix}",
+        internal=alb_internal,
+        load_balancer_type="application",
+        security_groups=alb_sg_ids,
+        subnets=alb_subnet_ids,
+        idle_timeout=600,
+        tags={**tags, "Name": f"{project_name}-alb{suffix}"},
+    )
 
-tg = aws.lb.TargetGroup(
-    f"{project_name}-tg{suffix}",
-    name=f"{project_name}-tg{suffix}",
-    port=app_port,
-    protocol="HTTP",
-    vpc_id=vpc_id,
-    deregistration_delay=30,
-    health_check=aws.lb.TargetGroupHealthCheckArgs(
-        enabled=True,
-        path="/v1/info",
-        port=str(app_port),
+    tg = aws.lb.TargetGroup(
+        f"{project_name}-tg{suffix}",
+        name=f"{project_name}-tg{suffix}",
+        port=app_port,
         protocol="HTTP",
-        healthy_threshold=2,
-        interval=30,
-        timeout=10,
-        unhealthy_threshold=3,
-        matcher="200",
-    ),
-    tags={**tags, "Name": f"{project_name}-tg{suffix}"},
-)
+        vpc_id=vpc_id,
+        deregistration_delay=30,
+        health_check=aws.lb.TargetGroupHealthCheckArgs(
+            enabled=True,
+            path="/v1/info",
+            port=str(app_port),
+            protocol="HTTP",
+            healthy_threshold=2,
+            interval=30,
+            timeout=10,
+            unhealthy_threshold=3,
+            matcher="200",
+        ),
+        tags={**tags, "Name": f"{project_name}-tg{suffix}"},
+    )
 
-# HTTP → HTTPS redirect
-aws.lb.Listener(
-    f"{project_name}-http{suffix}",
-    load_balancer_arn=alb.arn,
-    port=80,
-    protocol="HTTP",
-    default_actions=[aws.lb.ListenerDefaultActionArgs(
-        type="redirect",
-        redirect=aws.lb.ListenerDefaultActionRedirectArgs(port="443", protocol="HTTPS", status_code="HTTP_301"),
-    )],
-)
+    # HTTP → HTTPS redirect
+    aws.lb.Listener(
+        f"{project_name}-http{suffix}",
+        load_balancer_arn=alb.arn,
+        port=80,
+        protocol="HTTP",
+        default_actions=[aws.lb.ListenerDefaultActionArgs(
+            type="redirect",
+            redirect=aws.lb.ListenerDefaultActionRedirectArgs(port="443", protocol="HTTPS", status_code="HTTP_301"),
+        )],
+    )
 
-# HTTPS → target group
-aws.lb.Listener(
-    f"{project_name}-https{suffix}",
-    load_balancer_arn=alb.arn,
-    port=443,
-    protocol="HTTPS",
-    ssl_policy="ELBSecurityPolicy-TLS13-1-2-2021-06",
-    certificate_arn=acm_certificate_arn,
-    default_actions=[aws.lb.ListenerDefaultActionArgs(type="forward", target_group_arn=tg.arn)],
-)
+    # HTTPS → target group
+    aws.lb.Listener(
+        f"{project_name}-https{suffix}",
+        load_balancer_arn=alb.arn,
+        port=443,
+        protocol="HTTPS",
+        ssl_policy="ELBSecurityPolicy-TLS13-1-2-2021-06",
+        certificate_arn=acm_certificate_arn,
+        default_actions=[aws.lb.ListenerDefaultActionArgs(type="forward", target_group_arn=tg.arn)],
+    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Auto Scaling Group (min=max=1 — stateful, single instance)
@@ -281,7 +300,7 @@ asg = aws.autoscaling.Group(
     name=f"{project_name}-asg{suffix}",
     min_size=1, max_size=2, desired_capacity=1,
     vpc_zone_identifiers=alb_subnet_ids,
-    target_group_arns=[tg.arn],
+    target_group_arns=[existing_target_group_arn if use_existing_lb else tg.arn],
     launch_template=aws.autoscaling.GroupLaunchTemplateArgs(id=lt.id, version="$Latest"),
     health_check_type="ELB",
     health_check_grace_period=600,
@@ -304,7 +323,7 @@ aws.route53.Record(
     name=dns_name,
     type="CNAME",
     ttl=30,
-    records=[alb.dns_name],
+    records=[existing_alb_dns_name if use_existing_lb else alb.dns_name],
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -324,7 +343,7 @@ if _kg_host and _kg_token and _kg_mappings:
     _kg_services   = _kg_mappings.get("services", [])
 
     _pulumi_export_map = {
-        "alb_dns":  alb.dns_name,
+        "alb_dns":  alb.dns_name if alb else pulumi.Output.from_input(""),
         "url":      pulumi.Output.from_input(f"https://{dns_name}"),
         "asg_name": asg.name,
     }
@@ -372,7 +391,8 @@ if _kg_host and _kg_token and _kg_mappings:
 # ─────────────────────────────────────────────────────────────────────────────
 # Outputs
 # ─────────────────────────────────────────────────────────────────────────────
-pulumi.export("alb_dns",     alb.dns_name)
+if alb:
+    pulumi.export("alb_dns",     alb.dns_name)
 pulumi.export("url",         f"https://{dns_name}")
 pulumi.export("asg_name",    asg.name)
 pulumi.export("environment", env)
