@@ -123,34 +123,9 @@ kv_access = azure_native.authorization.RoleAssignment(
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Azure Storage Account + Blob Container (Iceberg warehouse, ADLS Gen2)
-# ─────────────────────────────────────────────────────────────────────────────
-sa_env_suffix        = env if env != "prod" else ""
-storage_account_name = (project_name.replace("-", "") + "nessie" + sa_env_suffix)[:24]
-
-storage_account = azure_native.storage.StorageAccount(
-    f"{project_name}-sa{suffix}",
-    resource_group_name=resource_group,
-    account_name=storage_account_name,
-    location=azure_location,
-    sku=azure_native.storage.SkuArgs(name="Standard_LRS"),
-    kind="StorageV2",
-    is_hns_enabled=True,
-    tags=tags,
-)
-
-azure_native.storage.BlobContainer(
-    f"{project_name}-warehouse{suffix}",
-    resource_group_name=resource_group,
-    account_name=storage_account.name,
-    container_name="warehouse",
-)
-
-storage_key = azure_native.storage.list_storage_account_keys_output(
-    resource_group_name=resource_group,
-    account_name=storage_account.name,
-).apply(lambda r: r.keys[0].value)
+# Storage account is created by dwe_nessie (the Iceberg catalog owner).
+# AZURE_STORAGE_ACCOUNT, AZURE_STORAGE_KEY must be copied from nessie's Pulumi
+# outputs into this service's Key Vault secret before deploying.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Public IP for Application Gateway (skipped when using existing load balancer)
@@ -331,7 +306,7 @@ if not use_common_lb:
 # ─────────────────────────────────────────────────────────────────────────────
 # Coordinator startup script — Trino coordinator (external Nessie via CATALOG_URL)
 # ─────────────────────────────────────────────────────────────────────────────
-def _build_coordinator_script(sa_name: str, sa_key: str) -> str:
+def _build_coordinator_script() -> str:
     sections = [
         f"#!/bin/bash\nset -e\nexec > >(tee /var/log/trino-init.log | logger -t trino-init) 2>&1\n\n# startup_code_version={startup_code_version}\necho 'Starting coordinator init'",
 
@@ -351,20 +326,18 @@ GIT_TOKEN=$(echo "$SECRET_JSON" | jq -r '.git_deploy_token')""",
 
         write_env_from_secret_json(),
 
-        # ── Azure-specific: inject Pulumi-provisioned storage values into .env ─
-        f"""echo "AZURE_STORAGE_ACCOUNT={sa_name}" >> /home/ubuntu/trino/.env
-echo "AZURE_STORAGE_KEY={sa_key}" >> /home/ubuntu/trino/.env
-echo "ICEBERG_WAREHOUSE_DIR=abfs://warehouse@{sa_name}.dfs.core.windows.net/" >> /home/ubuntu/trino/.env""",
+        # ── Construct ICEBERG_WAREHOUSE_DIR from AZURE_STORAGE_ACCOUNT in secret ─
+        """SA_NAME=$(echo "$SECRET_JSON" | jq -r '.AZURE_STORAGE_ACCOUNT // ""')
+if [ -n "$SA_NAME" ]; then
+  echo "ICEBERG_WAREHOUSE_DIR=abfs://warehouse@${SA_NAME}.dfs.core.windows.net/" >> /home/ubuntu/trino/.env
+fi""",
 
         generate_config_and_start(worker_count),
     ]
     script = "\n\n".join(sections)
     return base64.b64encode(script.encode()).decode()
 
-coordinator_custom_data = pulumi.Output.all(
-    storage_account.name,
-    storage_key,
-).apply(lambda args: _build_coordinator_script(*args))
+coordinator_custom_data = pulumi.Output.from_input(_build_coordinator_script())
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Coordinator VMSS (capacity=1) — App Gateway backend
@@ -434,7 +407,7 @@ coordinator_vmss = azure_native.compute.VirtualMachineScaleSet(
     ),
     tags=tags,
     opts=pulumi.ResourceOptions(
-        depends_on=([kv_access, storage_account] if use_common_lb else [app_gw, kv_access, storage_account]),
+        depends_on=([kv_access] if use_common_lb else [app_gw, kv_access]),
         replace_on_changes=["virtualMachineProfile"],
         delete_before_replace=True,
     ),
@@ -529,7 +502,6 @@ if _kg_host and _kg_token and _kg_mappings:
 if app_gw:
     pulumi.export("appgw_name",              app_gw.name)
 pulumi.export("coordinator_vmss_name",   coordinator_vmss.name)
-pulumi.export("storage_account_name",    storage_account.name)
 pulumi.export("url",                     f"https://{dns_record_name}.{dns_zone_name}")
 if public_ip:
     pulumi.export("public_ip",               public_ip.ip_address)
